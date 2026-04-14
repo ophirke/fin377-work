@@ -1,5 +1,5 @@
 [project]
-name = "fin377"
+name = "rossa"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -8,4 +8,5 @@ dependencies = [
     "yfinance>=1.2.2",
     "matplotlib>=3.8.0",
     "networkx>=3.2",
+    "openpyxl>=3.1.0",
 ]

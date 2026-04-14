@@ -19,6 +19,7 @@ def fetch_and_cache_stock_data(
     Fetches historical stock data, manages cache intelligently.
     
     Verifies which tickers are in cache, fetches missing ones, and updates cache.
+    Failed/delisted tickers are saved to cache with NaN values to avoid re-downloading.
     This ensures complete data without redundant downloads.
     
     Args:
@@ -27,16 +28,21 @@ def fetch_and_cache_stock_data(
         period: Historical period to fetch (e.g., '10y', '5y')
     
     Returns:
-        DataFrame with Close prices for all requested tickers
+        DataFrame with Close prices for all requested tickers (excluding failed tickers)
     """
     cached_tickers = set()
     cached_data = None
     
-    # Load existing cache if available
+    # Load existing cache if available (and non-empty)
     if os.path.exists(cache_file):
         print(f"Loading existing cache: {cache_file}...")
         cached_data = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-        cached_tickers = set(cached_data.columns)
+        # Only use cache if it has data rows; empty cache is corrupted
+        if len(cached_data) > 0:
+            cached_tickers = set(cached_data.columns)
+        else:
+            print(f"  → Cache is empty, will re-download all tickers")
+            cached_data = None
     
     # Identify missing tickers
     missing_tickers = [t for t in ticker_list if t not in cached_tickers]
@@ -51,27 +57,35 @@ def fetch_and_cache_stock_data(
         else:
             new_data = downloaded[['Close']]
         
-        # Drop any tickers that failed to download entirely
-        new_data = new_data.dropna(axis=1, how='all')
+        # CRITICAL FIX: Keep failed tickers with NaN values so they're not re-downloaded
+        # Only drop columns that are completely empty (shouldn't happen), but keep all-NaN columns
+        # from failed downloads to mark them as "attempted but failed"
         
         # Merge with cached data
-        if cached_data is not None:
-            # Align indices and combine
+        if cached_data is not None and len(cached_data) > 0:
+            # Align indices and combine (fills with NaN for missing dates in new data)
             all_data = pd.concat([cached_data, new_data], axis=1)
         else:
             all_data = new_data
     else:
-        if cached_data is None:
+        if cached_data is None or len(cached_data) == 0:
             raise ValueError(f"No cache found and no tickers to download")
         all_data = cached_data
     
-    # Keep only the requested tickers that exist
+    # Keep only the requested tickers that were attempted (including failed ones with NaN)
     available_tickers = [t for t in ticker_list if t in all_data.columns]
     all_data = all_data[available_tickers]
     
-    # Save updated cache
-    all_data.to_csv(cache_file)
-    print(f"Cache updated: {cache_file}")
+    # IMPORTANT: Only save cache if we have actual data (not just NaN columns)
+    if len(all_data) > 0:
+        all_data.to_csv(cache_file)
+        print(f"Cache updated: {cache_file}")
+    else:
+        print(f"WARNING: No data to save to cache (all downloads failed)")
+    
+    # Before returning, drop columns that are entirely NaN (failed downloads)
+    # These stay in cache for next run, but we don't analyze them
+    all_data = all_data.dropna(axis=1, how='all')
     
     return all_data
 
@@ -79,13 +93,14 @@ def fetch_and_cache_stock_data(
 def prepare_price_data(
     price_data: pd.DataFrame,
     start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    end_date: Optional[str] = None,
+    missing_tolerance: float = 0.20
 ) -> Tuple[pd.DataFrame, int]:
     """
     Cleans and prepares price data for analysis.
     
     - Filters by date range
-    - Drops stocks missing >5% of data
+    - Drops stocks missing >missing_tolerance (default 20%) of data
     - Forward/backward fills NaN values
     - Removes remaining NaNs
     
@@ -93,6 +108,7 @@ def prepare_price_data(
         price_data: DataFrame with close prices (index: date, columns: tickers)
         start_date: Start date (YYYY-MM-DD) or None for earliest
         end_date: End date (YYYY-MM-DD) or None for latest
+        missing_tolerance: Max fraction of missing data allowed (default 0.20 = 20%)
     
     Returns:
         Tuple of (cleaned_data, log_returns)
@@ -105,9 +121,15 @@ def prepare_price_data(
     if end_date:
         price_data = price_data[price_data.index <= end_date]
     
-    # Drop stocks missing more than 5% of data history
-    threshold = int(len(price_data) * 0.95)
+    initial_tickers = price_data.shape[1]
+    
+    # Drop stocks missing more than missing_tolerance of data history
+    threshold = int(len(price_data) * (1.0 - missing_tolerance))
     price_data = price_data.dropna(axis=1, thresh=threshold)
+    
+    dropped_tickers = initial_tickers - price_data.shape[1]
+    if dropped_tickers > 0:
+        print(f"  Dropped {dropped_tickers} stocks with >{missing_tolerance*100:.0f}% missing data")
     
     # Fill small gaps (trading halts, holidays) forward, then backward
     price_data = price_data.ffill().bfill()
@@ -116,13 +138,14 @@ def prepare_price_data(
     price_data = price_data.dropna()
     
     if price_data.empty or price_data.shape[1] < 2:
+        print(f"  ERROR: Only {price_data.shape[1]} stocks remain with overlapping data")
         raise ValueError("Not enough overlapping historical data to build a network")
     
     # Calculate log returns
     log_returns = np.log(price_data / price_data.shift(1)).dropna()
     
-    print(f"Analyzing {log_returns.shape[1]} stocks over {log_returns.shape[0]} trading days")
-    print(f"Date range: {price_data.index[0].date()} to {price_data.index[-1].date()}")
+    print(f"  → Analyzing {log_returns.shape[1]} stocks over {log_returns.shape[0]} trading days")
+    print(f"  → Date range: {price_data.index[0].date()} to {price_data.index[-1].date()}")
     
     return price_data, log_returns
 
