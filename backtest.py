@@ -6,24 +6,142 @@ period, allocating long positions to peripheral stocks and short positions to
 core stocks. Tracks daily portfolio values and outputs results to Excel with visualizations.
 """
 
-import argparse
 import logging
+import multiprocessing
 import os
+from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Dict, List, Optional, Tuple
+from multiprocessing import Pool
+from typing import Dict, List, Optional, Tuple, Union, Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 import rossa
+from config import DataConfig, load_sp500_constituents
+from data import init_worker_lock
 from factor import compute_factor_loadings, load_factor_data
+
+# ============================================================================
+# BACKTEST CONFIGURATION
+# ============================================================================
+
+
+@dataclass
+class BacktestConfig:
+    """Configuration for a single backtest run."""
+
+    ticker_list: Union[List[str], Callable[[str], List[str]]]
+    start_backtest_date: str
+    end_backtest_date: str
+    lookback_days: int
+    rebalance_interval_days: int
+    output_excel: Optional[str] = None
+    output_plots: bool = False
+    benchmark_tickers: Optional[List[str]] = None
+    factor_list: Optional[List[str]] = None
+    factor_lookback_days: Optional[int] = None
+    factor_data_file: str = "factor_returns.xlsx"
+    summary_file: Optional[str] = None
+
+
+@dataclass
+class BacktestResult:
+    """Results from a completed backtest run."""
+
+    portfolio_summary: pd.DataFrame
+    summary_stats: Dict
+    benchmark_data: Optional[Dict[str, pd.DataFrame]] = None
+    benchmark_metrics: Optional[Dict[str, Dict]] = None
+
+    @property
+    def total_return(self) -> float:
+        """Total return of the strategy."""
+        return self.summary_stats.get("Total_Return", 0.0)
+
+    @property
+    def annualized_return(self) -> float:
+        """Annualized geometric return."""
+        return self.summary_stats.get("Annualized_Return", 0.0)
+
+    @property
+    def arithmetic_annual_return(self) -> float:
+        """Annualized arithmetic average return."""
+        return self.summary_stats.get("Arithmetic_Annual_Return", 0.0)
+
+    @property
+    def volatility(self) -> float:
+        """Annualized volatility."""
+        return self.summary_stats.get("Volatility", 0.0)
+
+    @property
+    def sharpe_ratio(self) -> float:
+        """Sharpe ratio."""
+        return self.summary_stats.get("Sharpe_Ratio", 0.0)
+
+    @property
+    def sortino_ratio(self) -> float:
+        """Sortino ratio."""
+        return self.summary_stats.get("Sortino_Ratio", 0.0)
+
+    @property
+    def max_drawdown(self) -> float:
+        """Maximum drawdown."""
+        return self.summary_stats.get("Max_Drawdown", 0.0)
+
+    @property
+    def final_portfolio_value(self) -> float:
+        """Final portfolio value."""
+        if len(self.portfolio_summary) > 0:
+            return self.portfolio_summary["Portfolio_Value"].iloc[-1]
+        return 0.0
+
+    @property
+    def has_benchmarks(self) -> bool:
+        """Whether benchmark data was computed."""
+        return self.benchmark_data is not None and len(self.benchmark_data) > 0
+
+    def benchmark_comparison(self) -> Optional[pd.DataFrame]:
+        """Create a comparison DataFrame of strategy vs benchmarks."""
+        if not self.has_benchmarks:
+            return None
+
+        results = []
+        results.append(
+            {
+                "Name": "Strategy",
+                "Total Return": f"{self.total_return * 100:.2f}%",
+                "Annualized Return": f"{self.annualized_return * 100:.2f}%",
+                "Volatility": f"{self.volatility * 100:.2f}%",
+                "Sharpe Ratio": f"{self.sharpe_ratio:.4f}",
+                "Sortino Ratio": f"{self.sortino_ratio:.4f}",
+                "Max Drawdown": f"{self.max_drawdown * 100:.2f}%",
+            }
+        )
+
+        for ticker, metrics in self.benchmark_metrics.items():
+            results.append(
+                {
+                    "Name": ticker,
+                    "Total Return": f"{metrics.get('Total_Return', 0) * 100:.2f}%",
+                    "Annualized Return": f"{metrics.get('Annualized_Return', 0) * 100:.2f}%",
+                    "Volatility": f"{metrics.get('Volatility', 0) * 100:.2f}%",
+                    "Sharpe Ratio": f"{metrics.get('Sharpe_Ratio', 0):.4f}",
+                    "Sortino Ratio": f"{metrics.get('Sortino_Ratio', 0):.4f}",
+                    "Max Drawdown": f"{metrics.get('Max_Drawdown', 0) * 100:.2f}%",
+                }
+            )
+
+        return pd.DataFrame(results)
+
 
 # ============================================================================
 # LOGGING CONFIGURATION
 # ============================================================================
 
-LOG_LEVEL = logging.INFO  # Change to logging.DEBUG for verbose output
+LOG_LEVEL = logging.INFO
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -32,7 +150,154 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 RF_RATE = 0.03
+
+
+def calculate_benchmark_daily_values(
+    prices: pd.DataFrame,
+    benchmark_tickers: List[str],
+    start_date: str,
+    end_date: str,
+    initial_capital: float = 100000.0,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Calculate daily values for benchmark indices (equally weighted).
+
+    Args:
+        prices: DataFrame with all stock prices (index: date, columns: tickers)
+        benchmark_tickers: List of benchmark tickers
+        start_date: Backtest start (YYYY-MM-DD)
+        end_date: Backtest end (YYYY-MM-DD)
+        initial_capital: Starting capital (for benchmark comparison)
+
+    Returns:
+        Dictionary mapping benchmark_ticker -> daily_metrics_df with columns:
+        [Date, Price, Portfolio_Value, Daily_Return, Cumulative_Return]
+    """
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+
+    benchmark_data = {}
+
+    for ticker in benchmark_tickers:
+        if ticker not in prices.columns:
+            logger.warning(f"Benchmark ticker {ticker} not found in price data")
+            continue
+
+        # Get benchmark prices for date range
+        benchmark_prices = (
+            prices[(prices.index >= start) & (prices.index <= end)][[ticker]]
+            .ffill()
+            .copy()
+        )
+
+        benchmark_prices = benchmark_prices.dropna()
+
+        if benchmark_prices.empty:
+            logger.warning(f"No data for benchmark {ticker} in date range")
+            continue
+
+        # Calculate portfolio value assuming buy-and-hold
+        first_price = benchmark_prices.iloc[0, 0]
+        benchmark_prices["Portfolio_Value"] = (
+            benchmark_prices[ticker] / first_price * initial_capital
+        )
+        benchmark_prices["Daily_Return"] = benchmark_prices[ticker].pct_change()
+        benchmark_prices["Cumulative_Return"] = (
+            1 + benchmark_prices["Daily_Return"]
+        ).cumprod() - 1
+
+        # Rename columns for consistency
+        result_df = benchmark_prices[
+            ["Portfolio_Value", "Daily_Return", "Cumulative_Return"]
+        ].copy()
+        result_df.columns = ["Portfolio_Value", "Daily_Return", "Cumulative_Return"]
+        result_df["Date"] = benchmark_prices.index
+        result_df = result_df[
+            ["Date", "Portfolio_Value", "Daily_Return", "Cumulative_Return"]
+        ]
+        result_df = result_df.reset_index(drop=True)
+
+        benchmark_data[ticker] = result_df
+        logger.info(f"Benchmark {ticker}: {len(result_df)} trading days")
+
+    return benchmark_data
+
+
+def calculate_benchmark_metrics(
+    benchmark_data: Dict[str, pd.DataFrame],
+) -> Dict[str, Dict]:
+    """
+    Calculate metrics for all benchmarks.
+
+    Args:
+        benchmark_data: Dictionary mapping benchmark_ticker -> daily_metrics_df
+
+    Returns:
+        Dictionary mapping benchmark_ticker -> summary_stats_dict
+    """
+    benchmark_metrics = {}
+
+    for ticker, daily_metrics in benchmark_data.items():
+        daily_returns = daily_metrics["Daily_Return"].dropna()
+
+        if len(daily_returns) == 0:
+            logger.warning(f"No valid returns for benchmark {ticker}")
+            continue
+
+        # Total return
+        total_return = daily_metrics["Cumulative_Return"].iloc[-1]
+
+        # Volatility (annualized)
+        daily_volatility = daily_returns.std()
+        annualized_volatility = daily_volatility * np.sqrt(252)
+
+        # Annualized return
+        annual_return = (1 + total_return) ** (252 / len(daily_returns)) - 1
+
+        # Arithmetic average return (annualized)
+        arithmetic_annual_return = daily_returns.mean() * 252
+
+        # Volatility drag
+        volatility_drag = (annualized_volatility**2) / 2
+
+        # Sharpe Ratio
+        annual_return_excess = annual_return - RF_RATE
+        sharpe_ratio = (
+            annual_return_excess / annualized_volatility
+            if annualized_volatility > 0
+            else 0.0
+        )
+
+        # Sortino Ratio
+        target = 0.0
+        downside_diff = np.minimum(daily_returns - target, 0.0)
+        downside_volatility = np.sqrt((downside_diff**2).mean())
+        downside_volatility_annual = downside_volatility * np.sqrt(252)
+        sortino_ratio = (
+            annual_return_excess / downside_volatility_annual
+            if downside_volatility_annual > 0
+            else 0.0
+        )
+
+        # Max drawdown
+        running_max = daily_metrics["Portfolio_Value"].expanding().max()
+        drawdown_series = (running_max - daily_metrics["Portfolio_Value"]) / running_max
+        max_drawdown = drawdown_series.max()
+
+        benchmark_metrics[ticker] = {
+            "Total_Return": total_return,
+            "Annualized_Return": annual_return,
+            "Arithmetic_Annual_Return": arithmetic_annual_return,
+            "Volatility": annualized_volatility,
+            "Volatility_Drag": volatility_drag,
+            "Sharpe_Ratio": sharpe_ratio,
+            "Sortino_Ratio": sortino_ratio,
+            "Max_Drawdown": max_drawdown,
+        }
+
+    return benchmark_metrics
 
 
 def generate_rebalance_dates(
@@ -78,15 +343,13 @@ def allocate_by_coreness(results_df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame with columns ['Stock', 'Coreness', 'Allocation', 'Coreness_Rank']
     """
-    # Determine if stock is core or peripheral based on coreness score
-    results_df_without_IWM = results_df[results_df["Stock"] != "IWM"]
 
     # Use 20th percentile as threshold: stocks in lowest 20% are PERIPHERAL
     quantile_prop = 0.2
-    coreness_threshold = results_df_without_IWM["Coreness"].quantile(quantile_prop)
+    coreness_threshold = results_df["Coreness"].quantile(quantile_prop)
 
     # Count how many core and peripheral stocks
-    is_core = results_df_without_IWM["Coreness"] >= coreness_threshold
+    is_core = results_df["Coreness"] >= coreness_threshold
     n_core = is_core.sum()
     n_peripheral = (~is_core).sum()
     logger.info(
@@ -94,7 +357,7 @@ def allocate_by_coreness(results_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     allocations = []
-    for _, row in results_df_without_IWM.iterrows():
+    for _, row in results_df.iterrows():
         if row["Coreness"] >= coreness_threshold:
             # Core stock: divide -30% exposure equally among all core stocks
             allocation = -0.30 / n_core if n_core > 0 else 0.0
@@ -121,19 +384,17 @@ def allocate_by_coreness(results_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_rebalance_allocations(
-    ticker_list: List[str],
+    ticker_list: Union[List[str], Callable[[str], List[str]]],
     rebalance_dates: List[pd.Timestamp],
     lookback_days: int,
-    cache_file: str = "india_stocks_history.csv",
 ) -> Dict[pd.Timestamp, pd.DataFrame]:
     """
     Compute allocations for each rebalance date using Rossa algorithm.
 
     Args:
-        ticker_list: List of stock tickers
+        ticker_list: List of stock tickers OR callable that takes date string and returns ticker list
         rebalance_dates: List of rebalance dates
         lookback_days: Number of days of history to use for Rossa
-        cache_file: Cache file for price data
 
     Returns:
         Dictionary mapping rebalance_date -> allocation DataFrame
@@ -141,6 +402,12 @@ def get_rebalance_allocations(
     rebalance_allocations = {}
 
     for rebalance_date in rebalance_dates:
+        # Get tickers for this rebalance date (dynamic or static)
+        if callable(ticker_list):
+            current_tickers = list(ticker_list(rebalance_date.strftime("%Y-%m-%d")))
+        else:
+            current_tickers = ticker_list
+
         # Calculate lookback window
         lookback_start = rebalance_date - timedelta(days=lookback_days)
         # CRITICAL: Shift end date back 1 day to avoid lookahead bias
@@ -153,11 +420,10 @@ def get_rebalance_allocations(
 
         # Run Rossa analysis for this period
         results = rossa.analyze_core_periphery(
-            ticker_list=ticker_list,
+            ticker_list=current_tickers,
             price_history_start_date=lookback_start.strftime("%Y-%m-%d"),
             price_history_end_date=analysis_end_date.strftime("%Y-%m-%d"),
             visualize_filename=None,  # Skip visualization for speed
-            cache_file=cache_file,
         )
 
         # Get allocations based on coreness
@@ -442,6 +708,47 @@ def calculate_portfolio_metrics(
     return portfolio_summary, summary_stats
 
 
+def export_benchmark_data_to_excel(
+    benchmark_data: Dict[str, pd.DataFrame],
+    benchmark_metrics: Dict[str, Dict],
+    output_filename: str = "backtest_results.xlsx",
+) -> None:
+    """
+    Export benchmark data and metrics to Excel sheets.
+
+    Creates sheets for each benchmark:
+    - "Benchmark_[TICKER]": Daily performance data
+    - "Benchmark_Metrics": Comparison of all benchmark metrics
+
+    Args:
+        benchmark_data: Dictionary mapping benchmark_ticker -> daily_metrics_df
+        benchmark_metrics: Dictionary mapping benchmark_ticker -> summary_stats_dict
+        output_filename: Output Excel filename (will append to existing)
+    """
+    # Append to existing Excel file
+    with pd.ExcelWriter(output_filename, engine="openpyxl", mode="a") as writer:
+        # Export daily data for each benchmark
+        for ticker, daily_metrics in benchmark_data.items():
+            daily_export = daily_metrics.copy()
+            daily_export["Date"] = pd.to_datetime(daily_export["Date"]).dt.strftime(
+                "%Y-%m-%d"
+            )
+            daily_export.to_excel(writer, sheet_name=f"Benchmark_{ticker}", index=False)
+
+        # Export metrics comparison
+        if benchmark_metrics:
+            metrics_rows = []
+            for ticker, metrics in benchmark_metrics.items():
+                row = {"Benchmark": ticker}
+                row.update(metrics)
+                metrics_rows.append(row)
+
+            metrics_df = pd.DataFrame(metrics_rows)
+            metrics_df.to_excel(writer, sheet_name="Benchmark_Metrics", index=False)
+
+    logger.info(f"Benchmark data exported to Excel: {output_filename}")
+
+
 def export_to_excel(
     daily_holdings: pd.DataFrame,
     portfolio_summary: pd.DataFrame,
@@ -450,13 +757,16 @@ def export_to_excel(
     output_filename: str = "backtest_results.xlsx",
 ) -> None:
     """
-    Export backtest results to Excel workbook.
+    Export backtest results to Excel workbook with separate sheets for each metric.
 
-    Creates four sheets:
-    - "Daily Holdings": Daily position values (price-based tracking)
-    - "Portfolio Summary": Portfolio performance metrics
-    - "Performance Metrics": Key risk/return statistics
-    - "Rebalance Events": Rebalance decisions
+    Creates multiple sheets:
+    - "Position Values ($)": Daily position values by ticker (pivoted)
+    - "Prices ($)": Daily prices by ticker (pivoted)
+    - "Portfolio Total": Daily portfolio total value
+    - "Daily Return": Daily portfolio returns over time
+    - "Cumulative Return": Cumulative portfolio returns over time
+    - "Performance Metrics": Key risk/return summary statistics
+    - "Rebalance Events": Rebalance allocation decisions
 
     Args:
         daily_holdings: DataFrame from calculate_portfolio_daily_values
@@ -482,22 +792,48 @@ def export_to_excel(
     logger.debug(f"  Total daily records: {len(daily_holdings)}")
 
     with pd.ExcelWriter(output_filename, engine="openpyxl") as writer:
-        # Sheet 1: Daily Holdings
+        # Sheet 1: Daily Holdings (pivoted by ticker)
+        # Pivot Position_Value so each ticker is a column, dates are rows
         daily_export = daily_holdings.copy()
-        daily_export = daily_export[
-            ["Date", "Ticker", "Price", "Position_Value", "Portfolio_Total_Value"]
-        ]
-        daily_export["Date"] = daily_export["Date"].dt.strftime("%Y-%m-%d")
-        daily_export.to_excel(writer, sheet_name="Daily Holdings", index=False)
+        daily_export["Date"] = pd.to_datetime(daily_export["Date"]).dt.strftime("%Y-%m-%d")
+        
+        # Pivot position values by ticker
+        position_pivot = daily_export.pivot_table(
+            index="Date",
+            columns="Ticker",
+            values="Position_Value",
+            aggfunc="first"
+        )
+        position_pivot.to_excel(writer, sheet_name="Position Values ($)")
+        
+        # Pivot prices by ticker (optional, for reference)
+        price_pivot = daily_export.pivot_table(
+            index="Date",
+            columns="Ticker",
+            values="Price",
+            aggfunc="first"
+        )
+        price_pivot.to_excel(writer, sheet_name="Prices ($)")
+        
+        # Add portfolio total value (same for all tickers on each date)
+        portfolio_total = daily_export[["Date", "Portfolio_Total_Value"]].drop_duplicates(subset=["Date"]).set_index("Date")
+        portfolio_total.to_excel(writer, sheet_name="Portfolio Total")
 
-        # Sheet 2: Portfolio Summary
+        # Sheet 2: Portfolio Metrics (separate sheet for each metric)
         portfolio_export = portfolio_summary.copy()
         portfolio_export["Date"] = portfolio_export["Date"].dt.strftime("%Y-%m-%d")
         portfolio_export["Daily_Return"] = portfolio_export["Daily_Return"].fillna(0)
         portfolio_export["Cumulative_Return"] = portfolio_export[
             "Cumulative_Return"
         ].fillna(0)
-        portfolio_export.to_excel(writer, sheet_name="Portfolio Summary", index=False)
+        
+        # Create separate sheets for each metric
+        metrics_to_export = ["Daily_Return", "Cumulative_Return"]
+        for metric in metrics_to_export:
+            if metric in portfolio_export.columns:
+                metric_df = portfolio_export[["Date", metric]].copy()
+                sheet_name = metric.replace("_", " ")
+                metric_df.to_excel(writer, sheet_name=sheet_name, index=False)
 
         # Sheet 3: Performance Metrics
         metrics_data = [
@@ -541,18 +877,21 @@ def export_to_excel(
 
 
 def plot_backtest_results(
-    portfolio_summary: pd.DataFrame, output_dir: str = "."
+    portfolio_summary: pd.DataFrame,
+    benchmark_data: Optional[Dict[str, pd.DataFrame]] = None,
+    output_dir: str = ".",
 ) -> None:
     """
-    Create visualization plots for backtest results.
+    Create visualization plots for backtest results, optionally with benchmarks.
 
     Generates:
-    - Portfolio value over time
-    - Cumulative returns
+    - Portfolio value over time (with benchmark comparison)
+    - Cumulative returns (with benchmark comparison)
     - Drawdown from peak (inverted so big drawdowns go DOWN on graph)
 
     Args:
         portfolio_summary: DataFrame from calculate_portfolio_metrics
+        benchmark_data: Optional dict mapping benchmark_ticker -> daily_metrics_df
         output_dir: Directory to save plots
     """
     fig, axes = plt.subplots(3, 1, figsize=(14, 10))
@@ -561,33 +900,94 @@ def plot_backtest_results(
     axes[0].plot(
         portfolio_summary["Date"],
         portfolio_summary["Portfolio_Value"],
-        linewidth=2,
+        linewidth=2.5,
         color="blue",
+        label="Strategy",
+        zorder=10,
     )
+
+    # Add benchmark lines
+    if benchmark_data:
+        colors = plt.cm.Set2(np.linspace(0, 1, len(benchmark_data)))
+        for (ticker, bench_df), color in zip(benchmark_data.items(), colors):
+            axes[0].plot(
+                bench_df["Date"],
+                bench_df["Portfolio_Value"],
+                linewidth=1.5,
+                color=color,
+                label=ticker,
+                alpha=0.7,
+            )
+
     axes[0].set_title("Portfolio Value Over Time", fontsize=14, fontweight="bold")
     axes[0].set_xlabel("Date")
     axes[0].set_ylabel("Portfolio Value ($)")
     axes[0].grid(True, alpha=0.3)
+    axes[0].legend(loc="upper left", fontsize=9)
 
     # Plot 2: Cumulative Returns
     axes[1].plot(
         portfolio_summary["Date"],
         portfolio_summary["Cumulative_Return"] * 100,
-        linewidth=2,
+        linewidth=2.5,
         color="green",
+        label="Strategy",
+        zorder=10,
     )
+
+    # Add benchmark lines
+    if benchmark_data:
+        colors = plt.cm.Set2(np.linspace(0, 1, len(benchmark_data)))
+        for (ticker, bench_df), color in zip(benchmark_data.items(), colors):
+            axes[1].plot(
+                bench_df["Date"],
+                bench_df["Cumulative_Return"] * 100,
+                linewidth=1.5,
+                color=color,
+                label=ticker,
+                alpha=0.7,
+            )
+
     axes[1].set_title("Cumulative Returns (%)", fontsize=14, fontweight="bold")
     axes[1].set_xlabel("Date")
     axes[1].set_ylabel("Cumulative Return (%)")
     axes[1].grid(True, alpha=0.3)
     axes[1].axhline(y=0, color="red", linestyle="--", alpha=0.5)
+    axes[1].legend(loc="upper left", fontsize=9)
 
     # Plot 3: Drawdown from Peak (INVERTED - big drawdowns go DOWN)
     running_max = portfolio_summary["Portfolio_Value"].expanding().max()
     # Drawdown = (Current - Peak) / Peak (negative when price drops from peak)
     drawdown = (portfolio_summary["Portfolio_Value"] - running_max) / running_max * 100
     axes[2].fill_between(portfolio_summary["Date"], drawdown, 0, alpha=0.3, color="red")
-    axes[2].plot(portfolio_summary["Date"], drawdown, linewidth=2, color="darkred")
+    axes[2].plot(
+        portfolio_summary["Date"],
+        drawdown,
+        linewidth=2.5,
+        color="darkred",
+        label="Strategy",
+        zorder=10,
+    )
+
+    # Add benchmark drawdown lines
+    if benchmark_data:
+        colors = plt.cm.Set2(np.linspace(0, 1, len(benchmark_data)))
+        for (ticker, bench_df), color in zip(benchmark_data.items(), colors):
+            bench_running_max = bench_df["Portfolio_Value"].expanding().max()
+            bench_drawdown = (
+                (bench_df["Portfolio_Value"] - bench_running_max)
+                / bench_running_max
+                * 100
+            )
+            axes[2].plot(
+                bench_df["Date"],
+                bench_drawdown,
+                linewidth=1.5,
+                color=color,
+                label=ticker,
+                alpha=0.7,
+            )
+
     axes[2].set_title(
         "Drawdown from Peak (% - inverted, so down = bad)",
         fontsize=14,
@@ -595,9 +995,25 @@ def plot_backtest_results(
     )
     axes[2].set_xlabel("Date")
     axes[2].set_ylabel("Drawdown (%)")
-    axes[2].set_ylim([min(drawdown.min(), -1), 1])  # Ensure 0 line is visible
+    all_drawdowns = (
+        [drawdown]
+        if benchmark_data is None
+        else [drawdown]
+        + [
+            (
+                bench_df["Portfolio_Value"].expanding().max()
+                - bench_df["Portfolio_Value"]
+            )
+            / bench_df["Portfolio_Value"].expanding().max()
+            * 100
+            for bench_df in benchmark_data.values()
+        ]
+    )
+    min_dd = min([dd.min() for dd in all_drawdowns])
+    axes[2].set_ylim([min(min_dd, -1), 1])  # Ensure 0 line is visible
     axes[2].grid(True, alpha=0.3)
     axes[2].axhline(y=0, color="black", linestyle="-", alpha=0.3, linewidth=0.5)
+    axes[2].legend(loc="lower left", fontsize=9)
 
     plt.tight_layout()
     output_file = os.path.join(output_dir, "backtest_plots.png")
@@ -609,14 +1025,16 @@ def plot_backtest_results(
 def export_summary_txt(
     summary_stats: Dict,
     portfolio_summary: pd.DataFrame,
+    benchmark_metrics: Optional[Dict[str, Dict]] = None,
     output_filename: str = "summary.txt",
 ) -> None:
     """
-    Export backtest summary statistics to a simple text file.
+    Export backtest summary statistics to a simple text file, optionally with benchmarks.
 
     Args:
         summary_stats: Dict with performance metrics from calculate_portfolio_metrics
         portfolio_summary: DataFrame from calculate_portfolio_metrics
+        benchmark_metrics: Optional dict mapping benchmark_ticker -> summary_stats_dict
         output_filename: Output text filename
     """
     with open(output_filename, "w") as f:
@@ -624,7 +1042,7 @@ def export_summary_txt(
         f.write("BACKTEST SUMMARY\n")
         f.write("=" * 70 + "\n\n")
 
-        f.write("PERFORMANCE METRICS\n")
+        f.write("STRATEGY PERFORMANCE METRICS\n")
         f.write("-" * 70 + "\n")
         f.write(
             f"Total Return:                    {summary_stats['Total_Return'] * 100:>12.2f}%\n"
@@ -663,6 +1081,38 @@ def export_summary_txt(
             f"Final Portfolio Value:           ${portfolio_summary['Portfolio_Value'].iloc[-1]:>12,.2f}\n"
         )
         f.write("\n")
+
+        # Add benchmark comparison if available
+        if benchmark_metrics:
+            f.write("=" * 70 + "\n")
+            f.write("BENCHMARK COMPARISON\n")
+            f.write("=" * 70 + "\n\n")
+
+            for ticker, metrics in benchmark_metrics.items():
+                f.write(f"{ticker}\n")
+                f.write("-" * 70 + "\n")
+                f.write(
+                    f"Total Return:                    {metrics['Total_Return'] * 100:>12.2f}%\n"
+                )
+                f.write(
+                    f"Annualized Return (geometric):   {metrics['Annualized_Return'] * 100:>12.2f}%\n"
+                )
+                f.write(
+                    f"Arithmetic Average Return:       {metrics['Arithmetic_Annual_Return'] * 100:>12.2f}%\n"
+                )
+                f.write(
+                    f"Volatility (annualized):         {metrics['Volatility'] * 100:>12.2f}%\n"
+                )
+                f.write(
+                    f"Sharpe Ratio:                    {metrics['Sharpe_Ratio']:>12.4f}\n"
+                )
+                f.write(
+                    f"Sortino Ratio:                   {metrics['Sortino_Ratio']:>12.4f}\n"
+                )
+                f.write(
+                    f"Max Drawdown:                    {metrics['Max_Drawdown'] * 100:>12.2f}%\n"
+                )
+                f.write("\n")
 
         f.write("=" * 70 + "\n")
 
@@ -969,129 +1419,177 @@ def export_factor_analysis_to_excel(
     logger.info(f"Factor analysis exported: {output_filename}")
 
 
-def run_backtest(
-    ticker_list: List[str],
-    start_backtest_date: str,
-    end_backtest_date: str,
-    lookback_days: int,
-    rebalance_interval_days: int,
-    cache_file: str = "india_stocks_history.csv",
-    output_excel: str = "backtest_results.xlsx",
-    output_plots: bool = True,
-    factor_list: Optional[List[str]] = None,
-    factor_lookback_days: Optional[int] = None,
-    factor_data_file: str = "factor_returns.xlsx",
-    summary_file: str = "backtest_summary.txt",
-) -> pd.DataFrame:
+def run_backtest(config: BacktestConfig) -> BacktestResult:
     """
-    Run complete backtest of core-periphery strategy.
+    Run complete backtest of core-periphery strategy with optional benchmark comparison.
 
     Args:
-        ticker_list: List of stock tickers
-        start_backtest_date: Backtest start (YYYY-MM-DD)
-        end_backtest_date: Backtest end (YYYY-MM-DD)
-        lookback_days: Days of history for Rossa analysis
-        rebalance_interval_days: Days between rebalances
-        cache_file: Price data cache file
-        output_excel: Output Excel filename
-        output_plots: Whether to generate plots
-        factor_list: Optional list of factor names for factor analysis (None = use all)
-        factor_lookback_days: Optional number of days for factor lookback window
-        factor_data_file: Path to Excel file with factor returns
-        summary_file: Path to text file for summary output
+        config: BacktestConfig instance specifying all backtest parameters
+
     Returns:
-        Portfolio summary DataFrame
+        BacktestResult instance with portfolio_summary, summary_stats, and optional benchmark data
     """
     logger.info("=" * 70)
     logger.info("BACKTEST: CORE-PERIPHERY STRATEGY")
     logger.info("=" * 70)
-    logger.info(f"Backtest period: {start_backtest_date} to {end_backtest_date}")
-    logger.info(f"Lookback period: {lookback_days} days")
-    logger.info(f"Rebalance interval: {rebalance_interval_days} days")
-    logger.info(f"Tickers: {len(ticker_list)}")
+    logger.info(
+        f"Backtest period: {config.start_backtest_date} to {config.end_backtest_date}"
+    )
+    logger.info(f"Lookback period: {config.lookback_days} days")
+    logger.info(f"Rebalance interval: {config.rebalance_interval_days} days")
+    
+    # Determine if using dynamic or static ticker list
+    is_dynamic = callable(config.ticker_list)
+    if is_dynamic:
+        logger.info("Using dynamic S&P 500 constituent selection (avoiding survivorship bias)")
+    else:
+        logger.info(f"Using static ticker list: {len(config.ticker_list)} tickers")
 
-    # Step 1: Fetch price data
-    logger.info("[1/6] Fetching price data...")
-    # Convert list to tuple for caching
-    price_data = rossa.fetch_and_cache_stock_data(tuple(ticker_list), cache_file)
+    # Step 1: Generate rebalance dates first (needed for dynamic ticker fetching)
+    logger.info("[1/6] Generating rebalance schedule...")
+    rebalance_dates = generate_rebalance_dates(
+        config.start_backtest_date,
+        config.end_backtest_date,
+        config.rebalance_interval_days,
+    )
+    logger.info(f"  → {len(rebalance_dates)} rebalance dates generated")
+
+    # Step 2: Fetch price data
+    # For dynamic mode, fetch all unique tickers across all rebalance dates
+    if is_dynamic:
+        all_tickers_set = set()
+        for rebalance_date in rebalance_dates:
+            tickers = config.ticker_list(rebalance_date.strftime("%Y-%m-%d"))
+            all_tickers_set.update(tickers)
+        tickers_to_fetch = list(all_tickers_set)
+        logger.info(f"Dynamic mode will use {len(all_tickers_set)} unique tickers across rebalance dates")
+    else:
+        tickers_to_fetch = list(config.ticker_list)
+    
+    if config.benchmark_tickers:
+        tickers_to_fetch.extend(config.benchmark_tickers)
+
+    price_data = rossa.fetch_and_cache_stock_data(tuple(tickers_to_fetch))
 
     # Verify data covers the required backtest period
     actual_start = price_data.index[0]
     actual_end = price_data.index[-1]
     logger.info(f"Data covers period: {actual_start.date()} to {actual_end.date()}")
-    logger.info(f"Backtest will use: {start_backtest_date} to {end_backtest_date}")
-
-    # Step 2: Generate rebalance dates
-    logger.info("[2/6] Generating rebalance schedule...")
-    rebalance_dates = generate_rebalance_dates(
-        start_backtest_date, end_backtest_date, rebalance_interval_days
+    logger.info(
+        f"Backtest will use: {config.start_backtest_date} to {config.end_backtest_date}"
     )
-    logger.info(f"  → {len(rebalance_dates)} rebalance dates generated")
 
     # Step 3: Compute allocations for each rebalance
     logger.info("[3/6] Computing allocations for each rebalance...")
     rebalance_schedule = get_rebalance_allocations(
-        ticker_list, rebalance_dates, lookback_days, cache_file
+        config.ticker_list, rebalance_dates, config.lookback_days
     )
 
     # Step 4: Calculate daily portfolio values
     logger.info("[4/6] Calculating daily portfolio values...")
     daily_holdings = calculate_portfolio_daily_values(
-        price_data, rebalance_schedule, start_backtest_date, end_backtest_date
+        price_data,
+        rebalance_schedule,
+        config.start_backtest_date,
+        config.end_backtest_date,
     )
 
-    # Step 5: Calculate metrics and export
-    logger.info("[5/6] Generating reports...")
+    # Step 5: Calculate metrics
+    logger.info("[5/6] Calculating portfolio metrics...")
     portfolio_summary, summary_stats = calculate_portfolio_metrics(daily_holdings)
 
+    # Fetch benchmark data if requested
+    benchmark_data = None
+    benchmark_metrics = None
+
+    if config.benchmark_tickers:
+        logger.info("[5.5/6] Fetching benchmark data...")
+        benchmark_data = calculate_benchmark_daily_values(
+            price_data,
+            config.benchmark_tickers,
+            config.start_backtest_date,
+            config.end_backtest_date,
+        )
+        benchmark_metrics = calculate_benchmark_metrics(benchmark_data)
+
+    # Step 6: Export reports
+    logger.info("[5.6/6] Generating reports...")
+
     # Export Excel
-    if output_excel is not None:
+    if config.output_excel is not None:
+        os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
+        output_excel_path = os.path.join(
+            str(DataConfig.OUTPUT_DIR), config.output_excel
+        )
         export_to_excel(
             daily_holdings,
             portfolio_summary,
             rebalance_schedule,
             summary_stats,
-            output_excel,
+            output_excel_path,
         )
+        # Export benchmark data if available
+        if benchmark_data is not None:
+            export_benchmark_data_to_excel(
+                benchmark_data, benchmark_metrics, output_excel_path
+            )
 
     # Export summary text file
-    if summary_file is not None:
-        export_summary_txt(summary_stats, portfolio_summary, summary_file)
+    if config.summary_file is not None:
+        os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
+        summary_file_path = os.path.join(
+            str(DataConfig.OUTPUT_DIR), config.summary_file
+        )
+        export_summary_txt(
+            summary_stats, portfolio_summary, benchmark_metrics, summary_file_path
+        )
 
-    # Generate plots
-    if output_plots:
-        plot_backtest_results(portfolio_summary)
+    # Generate plots (with benchmarks if available)
+    if config.output_plots:
+        os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
+        plot_backtest_results(
+            portfolio_summary, benchmark_data, output_dir=str(DataConfig.OUTPUT_DIR)
+        )
 
     # Print summary statistics
-    print_backtest_summary(summary_stats, portfolio_summary)
+    print_backtest_summary(summary_stats, portfolio_summary, benchmark_metrics)
 
     # Step 6: Factor analysis (if requested)
     factor_loadings_df = None
     rsquared_series = None
 
-    if factor_lookback_days is not None and factor_lookback_days > 0:
+    if config.factor_lookback_days is not None and config.factor_lookback_days > 0:
         logger.info("[6/6] Computing factor analysis...")
         factor_loadings_df, rsquared_series = compute_factor_loadings_over_time(
             portfolio_summary=portfolio_summary,
             rebalance_dates=rebalance_dates,
-            factor_lookback_days=factor_lookback_days,
-            factor_list=factor_list,
-            factor_data_file=factor_data_file,
+            factor_lookback_days=config.factor_lookback_days,
+            factor_list=config.factor_list,
+            factor_data_file=config.factor_data_file,
         )
 
         if factor_loadings_df is not None:
-            # Plot factor loadings
+            os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
             plot_factor_loadings_multiline(
-                factor_loadings_df, "factor_loadings_multiline.png"
+                factor_loadings_df,
+                os.path.join(
+                    str(DataConfig.OUTPUT_DIR), "factor_loadings_multiline.png"
+                ),
             )
             plot_factor_loadings_subplots(
-                factor_loadings_df, "factor_loadings_subplots.png"
+                factor_loadings_df,
+                os.path.join(
+                    str(DataConfig.OUTPUT_DIR), "factor_loadings_subplots.png"
+                ),
             )
-            plot_factor_rsquared(rsquared_series, "factor_rsquared.png")
-
-            # Export to Excel
+            plot_factor_rsquared(
+                rsquared_series,
+                os.path.join(str(DataConfig.OUTPUT_DIR), "factor_rsquared.png"),
+            )
             export_factor_analysis_to_excel(
-                factor_loadings_df, rsquared_series, "factor_analysis.xlsx"
+                factor_loadings_df,
+                rsquared_series,
+                os.path.join(str(DataConfig.OUTPUT_DIR), "factor_analysis.xlsx"),
             )
 
             # Print summary of most recent loadings
@@ -1112,14 +1610,33 @@ def run_backtest(
                     logger.info(f"  {col:20s}: {loading:>10.6f}")
             logger.info("=" * 70)
 
-    return portfolio_summary, summary_stats
+    return BacktestResult(
+        portfolio_summary=portfolio_summary,
+        summary_stats=summary_stats,
+        benchmark_data=benchmark_data,
+        benchmark_metrics=benchmark_metrics,
+    )
+
+
+def _backtest_worker(config: BacktestConfig) -> Tuple[str, BacktestResult]:
+    """
+    Worker function for parallel backtest execution.
+    Returns: (start_date_str, BacktestResult)
+    """
+    # Disable logging in worker threads
+    logging.disable(logging.CRITICAL)
+
+    result = run_backtest(config)
+    return (config.start_backtest_date, result)
 
 
 def print_backtest_summary(
-    summary_stats: Dict, portfolio_summary: pd.DataFrame
+    summary_stats: Dict,
+    portfolio_summary: pd.DataFrame,
+    benchmark_metrics: Optional[Dict[str, Dict]] = None,
 ) -> None:
     logger.info("-" * 70)
-    logger.info("BACKTEST SUMMARY")
+    logger.info("BACKTEST SUMMARY - STRATEGY")
     logger.info("-" * 70)
     logger.info(f"Total Return: {summary_stats['Total_Return'] * 100:.2f}%")
     logger.info(
@@ -1137,6 +1654,22 @@ def print_backtest_summary(
         f"Final Portfolio Value: ${portfolio_summary['Portfolio_Value'].iloc[-1]:.2f}"
     )
     logger.info("=" * 70)
+
+    # Print benchmark comparison if available
+    if benchmark_metrics:
+        logger.info("-" * 70)
+        logger.info("BENCHMARK COMPARISON")
+        logger.info("-" * 70)
+        for ticker, metrics in benchmark_metrics.items():
+            logger.info(f"\n{ticker}:")
+            logger.info(f"  Total Return: {metrics['Total_Return'] * 100:.2f}%")
+            logger.info(
+                f"  Annualized Return: {metrics['Annualized_Return'] * 100:.2f}%"
+            )
+            logger.info(f"  Volatility: {metrics['Volatility'] * 100:.2f}%")
+            logger.info(f"  Sharpe Ratio: {metrics['Sharpe_Ratio']:.4f}")
+            logger.info(f"  Max Drawdown: {metrics['Max_Drawdown'] * 100:.2f}%")
+        logger.info("=" * 70)
 
 
 def plot_backtest_summary_over_time(
@@ -1218,21 +1751,31 @@ def plot_backtest_summary_over_time(
 
 def main() -> None:
     # Load tickers from file
-    if not os.path.exists("tickers.txt"):
-        logger.error("tickers.txt not found")
+    if not os.path.exists(str(DataConfig.TICKER_FILE)):
+        logger.error(f"{DataConfig.TICKER_FILE} not found")
         return
 
-    with open("tickers.txt", "r") as f:
+    with open(str(DataConfig.TICKER_FILE), "r") as f:
         ticker_list = [line.strip() for line in f if line.strip()]
 
-    logger.info(f"Loaded {len(ticker_list)} tickers from tickers.txt")
+    logger.info(f"Loaded {len(ticker_list)} tickers from {DataConfig.TICKER_FILE}")
 
     # =================== PARAMS ==================
-    
+
     lookback_days = 365
-    rebalance_interval_days = 3
-    
+    rebalance_interval_days = 30
+    factor_lookback_days = 365 * 3
+    benchmark_tickers = ["SPY", "QQQ"]
+
     # =================== PARAMS ==================
+
+    # =================== SETUP ==================
+
+    # prefetch
+    logger.info("Prefetching price data for all tickers...")
+    _ = rossa.fetch_and_cache_stock_data(tuple(ticker_list + benchmark_tickers))
+
+    # =================== SETUP ==================
 
     # Run backtest with default parameters
     overall_start_date = "2008-04-13"
@@ -1249,44 +1792,85 @@ def main() -> None:
 
     portfolio_summary_over_time = []
     summary_stats_over_time = []
-    for sub_start, sub_end in reversed(eval_date_pairs):
-        portfolio_summary, summary_stats = run_backtest(
-            ticker_list=ticker_list,
-            start_backtest_date=sub_start,
-            end_backtest_date=sub_end,
+
+    # Fetch price data once at the start (shared across all backtests)
+    logger.info("Fetching price data for all backtests...")
+
+    # Prepare BacktestConfig instances for parallel execution
+    logger.info(f"Running {len(eval_date_pairs)} backtests in parallel...")
+    backtest_configs = [
+        BacktestConfig(
+            ticker_list=load_sp500_constituents,
+            start_backtest_date=sub_start.strftime("%Y-%m-%d"),
+            end_backtest_date=sub_end.strftime("%Y-%m-%d"),
             lookback_days=lookback_days,
             rebalance_interval_days=rebalance_interval_days,
-            cache_file="india_stocks_history.csv",
             output_excel=None,
             output_plots=False,
+            benchmark_tickers=None,
             factor_list=None,
             factor_lookback_days=None,
-            factor_data_file="factor_returns.xlsx",
-            summary_file=None,
         )
-        # Add date to summary stats for tracking
-        summary_stats["Date"] = pd.to_datetime(sub_start)
-        portfolio_summary_over_time.append(portfolio_summary)
-        summary_stats_over_time.append(summary_stats)
+        for sub_start, sub_end in reversed(eval_date_pairs)
+    ]
 
-    plot_backtest_summary_over_time(summary_stats_over_time, "summary_over_time.png")
+    # Run backtests in parallel
+    num_workers = max(1, min(12, multiprocessing.cpu_count() - 4))
 
-    full_portfolio_summary, full_summary_stats = run_backtest(
-        ticker_list=ticker_list,
+    # Create a Manager and shared lock for cache synchronization across pool workers
+    manager = multiprocessing.Manager()
+    shared_lock = manager.Lock()
+
+    with Pool(
+        num_workers, initializer=init_worker_lock, initargs=(shared_lock,)
+    ) as pool:
+        results = list(
+            tqdm(
+                pool.imap_unordered(_backtest_worker, backtest_configs),
+                total=len(backtest_configs),
+                desc="Running backtests",
+            )
+        )
+
+    # Process results
+    results_dict = {r[0]: r[1] for r in results}
+    for sub_start, sub_end in reversed(eval_date_pairs):
+        date_key = sub_start.strftime("%Y-%m-%d")
+        if date_key in results_dict:
+            backtest_result = results_dict[date_key]
+            portfolio_summary_over_time.append(backtest_result.portfolio_summary)
+            summary_stats_over_time.append(backtest_result.summary_stats)
+
+    os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
+    plot_backtest_summary_over_time(
+        summary_stats_over_time,
+        os.path.join(str(DataConfig.OUTPUT_DIR), "summary_over_time.png"),
+    )
+
+    # Create and run final full backtest with all outputs
+    # Use dynamic S&P 500 constituents to avoid survivorship bias
+    final_config = BacktestConfig(
+        ticker_list=load_sp500_constituents,
         start_backtest_date="2008-04-13",
         end_backtest_date="2026-04-13",
         lookback_days=lookback_days,
         rebalance_interval_days=rebalance_interval_days,
-        cache_file="india_stocks_history.csv",
-        # output_excel="backtest_results.xlsx",
-        output_excel=None,
+        output_excel="backtest_results.xlsx",
         output_plots=True,
+        benchmark_tickers=benchmark_tickers,
         factor_list=None,  # Use all available factors
-        factor_lookback_days=365 * 3,
-        factor_data_file="factor_returns.xlsx",
+        factor_lookback_days=factor_lookback_days,
+        factor_data_file=str(DataConfig.FACTOR_FILE),
+        summary_file="backtest_summary.txt",
     )
-    
-    print_backtest_summary(full_summary_stats, full_portfolio_summary)
+
+    final_result = run_backtest(final_config)
+
+    print_backtest_summary(
+        final_result.summary_stats,
+        final_result.portfolio_summary,
+        benchmark_metrics=final_result.benchmark_metrics,
+    )
 
 
 if __name__ == "__main__":

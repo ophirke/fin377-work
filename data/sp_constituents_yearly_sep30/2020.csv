@@ -1,0 +1,506 @@
+Company,Weight,Ticker
+"Apple, Inc.",6.681,AAPL
+Microsoft Corp.,5.712,MSFT
+"Amazon.com, Inc.",4.811,AMZN
+"Facebook, Inc. Class A",2.26,META
+"Alphabet, Inc. Class A",1.58,GOOG
+"Alphabet, Inc. Class C",1.548,GOOG
+"Berkshire Hathaway, Inc. Class B",1.515,BRK.B
+Johnson & Johnson,1.407,JNJ
+Procter & Gamble Co.,1.242,PG
+"Visa, Inc. Class A",1.21,V
+NVIDIA Corp.,1.198,NVDA
+"Home Depot, Inc.",1.073,HD
+"Mastercard, Inc. Class A",1.072,MA
+"UnitedHealth Group, Inc.",1.064,UNH
+JPMorgan Chase & Co.,1.053,JPM
+"Verizon Communications, Inc.",0.883,VZ
+"Adobe, Inc.",0.844,ADBE
+"PayPal Holdings, Inc.",0.83,PYPL
+"salesforce.com, Inc.",0.821,CRM
+Walt Disney Co.,0.805,DIS
+"Netflix, Inc.",0.792,NFLX
+Intel Corp.,0.789,INTC
+Comcast Corp. Class A,0.757,CMCSA
+"Merck & Co., Inc.",0.753,MRK
+"Pfizer, Inc.",0.732,PFE
+"AT&T, Inc.",0.729,T
+"Walmart, Inc.",0.697,WMT
+Abbott Laboratories,0.692,ABT
+"PepsiCo, Inc.",0.689,PEP
+Coca-Cola Co.,0.685,KO
+Bank of America Corp.,0.659,BAC
+"Thermo Fisher Scientific, Inc.",0.628,TMO
+"Cisco Systems, Inc.",0.598,CSCO
+McDonald’s Corp.,0.586,MCD
+Costco Wholesale Corp.,0.563,COST
+"NIKE, Inc. Class B",0.56,NKE
+"AbbVie, Inc.",0.556,ABBV
+"Amgen, Inc.",0.534,AMGN
+"Broadcom, Inc.",0.524,AVGO
+Exxon Mobil Corp.,0.521,XOM
+Accenture PLC Class A,0.516,ACN
+Medtronic PLC,0.502,MDT
+"NextEra Energy, Inc.",0.488,NEE
+Danaher Corp.,0.488,DHR
+Bristol-Myers Squibb Co.,0.488,BMY
+Chevron Corp.,0.482,CVX
+Union Pacific Corp.,0.48,UNP
+"QUALCOMM, Inc.",0.476,QCOM
+"Texas Instruments, Inc.",0.469,TXN
+"Lowe’s Cos., Inc.",0.451,LOW
+Linde PLC,0.449,LIN
+"United Parcel Service, Inc. Class B",0.422,UPS
+Eli Lilly & Co.,0.422,LLY
+"Philip Morris International, Inc.",0.419,PM
+"Honeywell International, Inc.",0.415,HON
+Oracle Corp.,0.414,ORCL
+International Business Machines Corp.,0.389,IBM
+American Tower Corp. REIT,0.386,AMT
+Starbucks Corp.,0.361,SBUX
+Wells Fargo & Co.,0.348,WFC
+"Advanced Micro Devices, Inc.",0.345,AMD
+Lockheed Martin Corp.,0.338,LMT
+"Charter Communications, Inc. Class A",0.335,CHTR
+"ServiceNow, Inc.",0.333,NOW
+3M Co.,0.332,MMM
+"Fidelity National Information Services, Inc.",0.327,FIS
+"Citigroup, Inc.",0.323,C
+Raytheon Technologies Corp.,0.315,RTX
+Boeing Co.,0.315,BA
+"S&P Global, Inc.",0.313,SPGI
+"Intuit, Inc.",0.306,INTU
+"Intuitive Surgical, Inc.",0.298,ISRG
+"Mondelez International, Inc. Class A",0.294,MDLZ
+"Caterpillar, Inc.",0.291,CAT
+"BlackRock, Inc.",0.287,BLK
+"Gilead Sciences, Inc.",0.284,GILD
+Target Corp.,0.283,TGT
+"Zoetis, Inc.",0.282,ZTS
+CVS Health Corp.,0.275,CVS
+"Prologis, Inc. REIT",0.266,PLD
+"Altria Group, Inc.",0.258,MO
+"Vertex Pharmaceuticals, Inc.",0.254,VRTX
+"Booking Holdings, Inc.",0.252,BKNG
+Crown Castle International Corp. REIT,0.25,CCI
+Deere & Co.,0.25,DE
+"Goldman Sachs Group, Inc.",0.248,GS
+Stryker Corp.,0.244,SYK
+"Anthem, Inc.",0.242,ELV
+"Equinix, Inc. REIT",0.242,EQIX
+Becton Dickinson and Co.,0.242,BDX
+"TJX Cos., Inc.",0.24,TJX
+"T-MobileUS, Inc.",0.239,TMUS
+"Dominion Energy, Inc.",0.238,D
+Colgate-Palmolive Co.,0.237,CL
+"Air Products & Chemicals, Inc.",0.235,APD
+American Express Co.,0.235,AXP
+Duke Energy Corp.,0.234,DUK
+"Activision Blizzard, Inc.",0.225,MSFT
+Cigna Corp.,0.223,CI
+FedEx Corp.,0.218,FDX
+"Automatic Data Processing, Inc.",0.216,ADP
+"CME Group, Inc.",0.215,CME
+CSX Corp.,0.214,CSX
+"Regeneron Pharmaceuticals, Inc.",0.21,REGN
+"Marsh & McLennan Cos., Inc.",0.208,MRSH
+Morgan Stanley,0.208,MS
+Southern Co.,0.206,SO
+"Fiserv, Inc.",0.206,FISV
+Sherwin-Williams Co.,0.205,SHW
+"Intercontinental Exchange, Inc.",0.202,ICE
+"Illinois Tool Works, Inc.",0.2,ITW
+Progressive Corp.,0.198,PGR
+Boston Scientific Corp.,0.197,BSX
+"Humana, Inc.",0.196,HUM
+Norfolk Southern Corp.,0.196,NSC
+"Applied Materials, Inc.",0.195,AMAT
+General Electric Co.,0.195,GE
+"Global Payments, Inc.",0.191,GPN
+"Chubb, Ltd.",0.188,CB
+"Micron Technology, Inc.",0.188,MU
+Dollar General Corp.,0.187,DG
+Truist Financial Corp.,0.185,TFC
+Newmont Corp.,0.183,NEM
+"Autodesk, Inc.",0.182,ADSK
+Kimberly-Clark Corp.,0.181,KMB
+Edwards Lifesciences Corp.,0.178,EW
+"Ecolab, Inc.",0.178,ECL
+US Bancorp,0.177,USB
+"Estee Lauder Cos., Inc. Class A",0.177,EL
+Northrop Grumman Corp.,0.176,NOC
+Lam Research Corp.,0.172,LRCX
+Aon PLC Class A,0.172,AON
+Moody’s Corp.,0.169,MCO
+"PNC Financial Services Group, Inc.",0.168,PNC
+"Illumina, Inc.",0.163,ILMN
+"Biogen, Inc.",0.161,BIIB
+"Waste Management, Inc.",0.158,WM
+"Analog Devices, Inc.",0.154,ADI
+Charles Schwab Corp.,0.151,SCHW
+"DuPont de Nemours, Inc.",0.147,DD
+"Roper Technologies, Inc.",0.147,ROP
+"Baxter International, Inc.",0.147,BAX
+Eaton Corp. PLC,0.147,ETN
+"American Electric Power Co., Inc.",0.145,AEP
+"Digital Realty Trust, Inc. REIT",0.142,DLR
+"DexCom, Inc.",0.142,DXCM
+Emerson Electric Co.,0.141,EMR
+"Electronic Arts, Inc.",0.136,EA
+Cognizant Technology Solutions Corp. Class A,0.136,CTSH
+"General Mills, Inc.",0.133,GIS
+General Motors Co.,0.133,GM
+"L3Harris Technologies, Inc.",0.132,LHX
+"Xcel Energy, Inc.",0.129,XEL
+SBA Communications Corp. REIT,0.128,SBAC
+ConocoPhillips,0.127,COP
+"Twitter, Inc.",0.126,TWTR
+"Dow, Inc.",0.125,DOW
+"Chipotle Mexican Grill, Inc.",0.125,CMG
+Exelon Corp.,0.124,EXC
+"eBay, Inc.",0.124,EBAY
+"O’Reilly Automotive, Inc.",0.123,ORLY
+Sempra Energy,0.123,SRE
+Public Storage REIT,0.122,PSA
+Centene Corp.,0.121,CNC
+"IDEXX Laboratories, Inc.",0.121,IDXX
+"Ross Stores, Inc.",0.119,ROST
+"HCA Healthcare, Inc.",0.118,HCA
+Capital One Financial Corp.,0.118,COF
+"Synopsys, Inc.",0.116,SNPS
+General Dynamics Corp.,0.116,GD
+"TE Connectivity, Ltd.",0.116,TEL
+Amphenol Corp. Class A,0.115,APH
+Sysco Corp.,0.114,SYY
+"Constellation Brands, Inc. Class A",0.113,STZ
+"Cummins, Inc.",0.112,CMI
+"Agilent Technologies, Inc.",0.112,A
+Johnson Controls International PLC,0.109,JCI
+"WEC Energy Group, Inc.",0.109,WEC
+"Verisk Analytics, Inc.",0.108,VRSK
+"IQVIA Holdings, Inc.",0.108,IQV
+KLA Corp.,0.108,KLAC
+"MSCI, Inc.",0.107,MSCI
+"Cadence Design Systems, Inc.",0.107,CDNS
+Allstate Corp.,0.106,ALL
+Monster Beverage Corp.,0.106,MNST
+"PACCAR, Inc.",0.105,PCAR
+"IHS Markit, Ltd.",0.105,SPGI
+"T Rowe Price Group, Inc.",0.105,TROW
+Trane Technologies PLC,0.104,TT
+Cintas Corp.,0.104,CTAS
+"PPG Industries, Inc.",0.103,PPG
+"MetLife, Inc.",0.103,MET
+Eversource Energy,0.101,ES
+"Zimmer Biomet Holdings, Inc.",0.1,ZBH
+"ANSYS, Inc.",0.1,SNPS
+Bank of New York Mellon Corp.,0.1,BK
+"AutoZone, Inc.",0.099,AZO
+"Public Service Enterprise Group, Inc.",0.099,PEG
+"Yum! Brands, Inc.",0.099,YUM
+"Travelers Cos., Inc.",0.098,TRV
+Ball Corp.,0.098,BALL
+"Motorola Solutions, Inc.",0.096,MSI
+Willis Towers Watson PLC,0.096,WTW
+Kroger Co.,0.095,KR
+Clorox Co.,0.094,CLX
+"HP, Inc.",0.094,HPQ
+"American Water Works Co., Inc.",0.093,AWK
+"Microchip Technology, Inc.",0.093,MCHP
+Ford Motor Co.,0.093,F
+Parker-Hannifin Corp.,0.093,PH
+"Stanley Black & Decker, Inc.",0.093,SWK
+"Walgreens Boots Alliance, Inc.",0.093,WBA
+"Consolidated Edison, Inc.",0.093,ED
+Archer-Daniels-Midland Co.,0.093,ADM
+"TransDigm Group, Inc.",0.092,TDG
+Fortive Corp.,0.092,FTV
+Fastenal Co.,0.092,FAST
+"Xilinx, Inc.",0.091,AMD
+"Rockwell Automation, Inc.",0.091,ROK
+"Paychex, Inc.",0.091,PAYX
+"Best Buy Co., Inc.",0.091,BBY
+"Alexion Pharmaceuticals, Inc.",0.091,AZN
+Otis Worldwide Corp.,0.091,OTIS
+"Prudential Financial, Inc.",0.09,PRU
+"D.R. Horton, Inc.",0.09,DHI
+"Corning, Inc.",0.089,GLW
+Carrier Global Corp.,0.089,CARR
+Aptiv PLC,0.089,APTV
+"Marriott International, Inc. Class A",0.088,MAR
+"ResMed, Inc.",0.088,RMD
+"Skyworks Solutions, Inc.",0.087,SWKS
+"Aflac, Inc.",0.086,AFL
+McKesson Corp.,0.086,MCK
+"American International Group, Inc.",0.086,AIG
+"Kinder Morgan, Inc.",0.086,KMI
+"Hilton Worldwide Holdings, Inc.",0.085,HLT
+"McCormick & Co., Inc.",0.085,MKC
+"Williams Cos., Inc.",0.085,WMB
+"Align Technology, Inc.",0.084,ALGN
+"Mettler-Toledo International, Inc.",0.083,MTD
+"Welltower, Inc. REIT",0.083,WELL
+"Church & Dwight Co., Inc.",0.082,CHD
+Phillips 66,0.081,PSX
+"Freeport-McMoRan, Inc.",0.081,FCX
+"AMETEK, Inc.",0.081,AME
+VF Corp.,0.081,VFC
+Lennar Corp. Class A,0.081,LEN
+Southwest Airlines Co.,0.079,LUV
+Cerner Corp.,0.079,ORCL
+DTE Energy Co.,0.079,DTE
+"Dollar Tree, Inc.",0.077,DLTR
+"Copart, Inc.",0.077,CPRT
+"Corteva, Inc.",0.077,CTVA
+Schlumberger NV,0.077,SLB
+Hershey Co.,0.076,HSY
+Weyerhaeuser Co. REIT,0.076,WY
+State Street Corp.(c),0.075,STT
+PPL Corp.,0.075,PPL
+"EOG Resources, Inc.",0.075,EOG
+Realty Income Corp. REIT,0.075,O
+"AvalonBay Communities, Inc. REIT",0.075,AVB
+"VeriSign, Inc.",0.074,VRSN
+"West Pharmaceutical Services, Inc.",0.073,WST
+Arthur J Gallagher & Co.,0.072,AJG
+"FleetCor Technologies, Inc.",0.072,FLT
+"Simon Property Group, Inc. REIT",0.071,SPG
+"Republic Services, Inc.",0.07,RSG
+Entergy Corp.,0.07,ETR
+"Delta Air Lines, Inc.",0.07,DAL
+Kraft Heinz Co.,0.07,KHC
+Edison International,0.069,EIX
+Ameren Corp.,0.069,AEE
+Marathon Petroleum Corp.,0.068,MPC
+"Equifax, Inc.",0.068,EFX
+"Alexandria Real Estate Equities, Inc. REIT",0.067,ARE
+"Ameriprise Financial, Inc.",0.067,AMP
+"Keysight Technologies, Inc.",0.066,KEYS
+"Take-TwoInteractive Software, Inc.",0.066,TTWO
+First Republic Bank,0.066,FRCB
+"Maxim Integrated Products, Inc.",0.066,ADI
+Laboratory Corp. of America Holdings,0.065,LH
+"MarketAxess Holdings, Inc.",0.065,MKTX
+LyondellBasell Industries NV Class A,0.065,LYB
+Vulcan Materials Co.,0.064,VMC
+"Akamai Technologies, Inc.",0.064,AKAM
+Valero Energy Corp.,0.064,VLO
+Discover Financial Services,0.064,COF
+Equity Residential REIT,0.063,EQR
+"Tyson Foods, Inc. Class A",0.063,TSN
+Amcor PLC,0.063,AMCR
+CMS Energy Corp.,0.062,CMS
+"Conagra Brands, Inc.",0.062,CAG
+"Old Dominion Freight Line, Inc.",0.062,ODFL
+Kansas City Southern,0.062,CP
+"Hologic, Inc.",0.062,HOLX
+CDW Corp.,0.062,CDW
+"Citrix Systems, Inc.",0.061,CTXS
+Tractor Supply Co.,0.061,TSCO
+Incyte Corp.,0.06,INCY
+"Cooper Cos., Inc.",0.059,COO
+"Domino’s Pizza, Inc.",0.059,DPZ
+Northern Trust Corp.,0.058,NTRS
+"W.W. Grainger, Inc.",0.058,GWW
+Kellogg Co.,0.058,KLG
+International Paper Co.,0.057,IP
+"Fortinet, Inc.",0.057,FTNT
+"ViacomCBS, Inc. Class B",0.057,PARA
+Dover Corp.,0.056,DOV
+"CBRE Group, Inc. Class A",0.056,CBRE
+"Teleflex, Inc.",0.056,TFX
+"Varian Medical Systems, Inc.",0.056,SIE
+FirstEnergy Corp.,0.056,FE
+"Ventas, Inc. REIT",0.056,VTR
+"Expeditors International of Washington, Inc.",0.055,EXPD
+Las Vegas Sands Corp.,0.055,LVS
+"Paycom Software, Inc.",0.055,PAYC
+"Quest Diagnostics, Inc.",0.054,DGX
+Fifth Third Bancorp,0.054,FITB
+"CarMax, Inc.",0.054,KMX
+"Broadridge Financial Solutions, Inc.",0.054,BR
+"Xylem, Inc.",0.054,XYL
+"Qorvo, Inc.",0.054,QRVO
+STERIS PLC,0.054,STE
+"Healthpeak Properties, Inc. REIT",0.053,DOC
+"Martin Marietta Materials, Inc.",0.053,MLM
+Masco Corp.,0.052,MAS
+"Etsy, Inc.",0.052,ETSY
+AmerisourceBergen Corp.,0.051,COR
+Pioneer Natural Resources Co.,0.051,XOM
+"NVR, Inc.",0.051,NVR
+Synchrony Financial,0.051,SYF
+"Nasdaq, Inc.",0.051,NDAQ
+"Catalent, Inc.",0.05,CTLT
+"Tyler Technologies, Inc.",0.05,TYL
+"Extra Space Storage, Inc. REIT",0.05,EXR
+"PerkinElmer, Inc.",0.05,RVTY
+Genuine Parts Co.,0.05,GPC
+"C.H. Robinson Worldwide, Inc.",0.049,CHRW
+"Cardinal Health, Inc.",0.049,CAH
+FMC Corp.,0.049,FMC
+Brown-Forman Corp. Class B,0.049,BF.B
+"Garmin, Ltd.",0.049,GRMN
+Zebra Technologies Corp. Class A,0.049,ZBRA
+IDEX Corp.,0.049,IEX
+Hormel Foods Corp.,0.049,HRL
+Duke Realty Corp. REIT,0.049,PLD
+Nucor Corp.,0.049,NUE
+"Hartford Financial Services Group, Inc.",0.048,HIG
+"Ingersoll Rand, Inc.",0.047,IR
+"Teradyne, Inc.",0.047,TER
+"Mid-AmericaApartment Communities, Inc. REIT",0.047,MAA
+"Darden Restaurants, Inc.",0.047,DRI
+"Essex Property Trust, Inc. REIT",0.047,ESS
+J.M. Smucker Co.,0.047,SJM
+"International Flavors & Fragrances, Inc.",0.047,IFF
+Celanese Corp.,0.047,CE
+"Ulta Beauty, Inc.",0.046,ULTA
+"Expedia Group, Inc.",0.045,EXPE
+"United Rentals, Inc.",0.045,URI
+SVB Financial Group,0.045,SIVBQ
+"ABIOMED, Inc.",0.045,JNJ
+"PulteGroup, Inc.",0.045,PHM
+Alliant Energy Corp.,0.045,LNT
+Tiffany & Co.,0.045,LVMUY
+"Jack Henry & Associates, Inc.",0.044,JKHY
+"NortonLifeLock, Inc.",0.044,GEN
+Waters Corp.,0.044,WAT
+Hewlett Packard Enterprise Co.,0.044,HPE
+"Jacobs Engineering Group, Inc.",0.043,J
+"Fortune Brands Home & Security, Inc.",0.043,FBIN
+AES Corp.,0.043,AES
+"Leidos Holdings, Inc.",0.043,LDOS
+M&T Bank Corp.,0.042,MTB
+Cincinnati Financial Corp.,0.042,CINF
+KeyCorp,0.042,KEY
+"Evergy, Inc.",0.042,EVRG
+"Boston Properties, Inc. REIT",0.041,BXP
+"ONEOK, Inc.",0.041,OKE
+"Royal Caribbean Cruises, Ltd.",0.041,RCL
+Whirlpool Corp.,0.041,WHR
+Atmos Energy Corp.,0.041,ATO
+"Teledyne Technologies, Inc.",0.041,TDY
+ETRADE Financial Corp.,0.041,MS
+Westinghouse Air Brake Technologies Corp.,0.04,WAB
+"Arista Networks, Inc.",0.04,ANET
+Hess Corp.,0.04,CVX
+Regions Financial Corp.,0.04,RF
+"Gartner, Inc.",0.04,IT
+"Bio-RadLaboratories, Inc. Class A",0.04,BIO
+"Citizens Financial Group, Inc.",0.039,CFG
+Seagate Technology PLC,0.039,STX
+"JB Hunt Transport Services, Inc.",0.039,JBHT
+"Omnicom Group, Inc.",0.039,OMC
+Western Digital Corp.,0.038,WDC
+Eastman Chemical Co.,0.038,EMN
+Avery Dennison Corp.,0.038,AVY
+"Advance Auto Parts, Inc.",0.038,AAP
+Halliburton Co.,0.038,HAL
+"CenterPoint Energy, Inc.",0.038,CNP
+"Hasbro, Inc.",0.038,HAS
+"Principal Financial Group, Inc.",0.037,PFG
+Packaging Corp. of America,0.037,PKG
+"United Continental Holdings, Inc.",0.036,UAL
+"NetApp, Inc.",0.036,NTAP
+Campbell Soup Co.,0.035,CPB
+"Cboe Global Markets, Inc.",0.035,CBOE
+Fox Corp. Class A,0.035,FOX
+"DENTSPLY SIRONA, Inc.",0.035,XRAY
+"CenturyLink, Inc.",0.035,LUMN
+"Lamb Weston Holdings, Inc.",0.035,LW
+"UDR, Inc. REIT",0.034,UDR
+Albemarle Corp.,0.034,ALB
+"Huntington Bancshares, Inc.",0.034,HBAN
+Allegion PLC,0.033,ALLE
+"Raymond James Financial, Inc.",0.032,RJF
+Western Union Co.,0.032,WU
+MGM Resorts International,0.032,MGM
+WestRock Co.,0.032,WRK
+WR Berkley Corp.,0.032,WRB
+"Concho Resources, Inc.",0.032,COP
+Baker Hughes Co.,0.031,BKR
+"Henry Schein, Inc.",0.031,HSIC
+"Universal Health Services, Inc. Class B",0.031,UHS
+Loews Corp.,0.03,L
+Occidental Petroleum Corp.,0.03,OXY
+Pinnacle West Capital Corp.,0.03,PNW
+"Textron, Inc.",0.03,TXT
+"NiSource, Inc.",0.029,NI
+"Snap-on,Inc.",0.029,SNA
+"Globe Life, Inc.",0.029,GL
+"BorgWarner, Inc.",0.029,BWA
+"Everest Re Group, Ltd.",0.028,EG
+Carnival Corp.,0.028,CCL
+"NRG Energy, Inc.",0.028,NRG
+LKQ Corp.,0.028,LKQ
+"Host Hotels & Resorts, Inc. REIT",0.028,HST
+Pentair PLC,0.028,PNR
+"Iron Mountain, Inc. REIT",0.027,IRM
+"Rollins, Inc.",0.027,ROL
+Mylan NV,0.027,VTRS
+"Live Nation Entertainment, Inc.",0.027,LYV
+"Quanta Services, Inc.",0.027,PWR
+DISH Network Corp. Class A,0.027,SATS
+"Assurant, Inc.",0.026,AIZ
+"F5 Networks, Inc.",0.026,FFIV
+AO Smith Corp.,0.026,AOS
+"Juniper Networks, Inc.",0.026,HPE
+"L Brands, Inc.",0.026,VSCO
+Cabot Oil & Gas Corp.,0.025,CTRA
+"Wynn Resorts, Ltd.",0.025,WYNN
+"DaVita, Inc.",0.025,DVA
+"CF Industries Holdings, Inc.",0.024,CF
+"Newell Brands, Inc.",0.023,NWL
+"Howmet Aerospace, Inc.",0.023,HWM
+"Interpublic Group of Cos., Inc.",0.023,IPG
+Mosaic Co.,0.023,MOS
+Molson Coors Brewing Co. Class B,0.022,TAP
+Perrigo Co. PLC,0.022,PRGO
+"Discovery, Inc. Class C",0.022,WBD
+"Robert Half International, Inc.",0.022,RHI
+"American Airlines Group, Inc.",0.022,AAL
+Sealed Air Corp.,0.022,SEE
+IPG Photonics Corp.,0.022,IPGP
+Regency Centers Corp. REIT,0.022,REG
+"Mohawk Industries, Inc.",0.021,MHK
+"Huntington Ingalls Industries, Inc.",0.021,HII
+"Franklin Resources, Inc.",0.021,BEN
+"Hanesbrands, Inc.",0.02,GIL
+Lincoln National Corp.,0.02,LNC
+"Comerica, Inc.",0.02,CMA
+Vornado Realty Trust REIT,0.019,VNO
+"Leggett & Platt, Inc.",0.019,LEG
+News Corp. Class A,0.019,NWS
+Federal Realty Investment Trust REIT,0.018,FRT
+Apartment Investment & Management Co. Class A REIT,0.018,AIV
+Zions Bancorp,0.018,ZION
+Nielsen Holdings PLC,0.018,NLSN
+"Diamondback Energy, Inc.",0.017,FANG
+"FLIR Systems, Inc.",0.017,TDY
+Kimco Realty Corp. REIT,0.017,KIM
+"People’s United Financial, Inc.",0.016,MTB
+DXC Technology Co.,0.016,DXC
+"Alaska Air Group, Inc.",0.016,ALK
+Fox Corp. Class B,0.016,FOX
+PVH Corp.,0.016,PVH
+"Norwegian Cruise Line Holdings, Ltd.",0.016,NCLH
+"Tapestry, Inc.",0.015,TPR
+"Invesco, Ltd.",0.015,IVZ
+"Noble Energy, Inc.",0.015,CVX
+Devon Energy Corp.,0.013,DVN
+"Gap, Inc.",0.013,GAP
+Apache Corp.,0.013,APA
+Unum Group,0.013,UNM
+Xerox Holdings Corp.,0.013,XRX
+Flowserve Corp.,0.013,FLS
+"National Oilwell Varco, Inc.",0.012,NOV
+"Discovery, Inc. Class A",0.012,WBD
+SL Green Realty Corp. REIT,0.012,SLG
+Ralph Lauren Corp.,0.012,RL
+Marathon Oil Corp.,0.012,COP
+HollyFrontier Corp.,0.01,DINO
+TechnipFMC PLC,0.009,FTI
+"Under Armour, Inc. Class A",0.007,UA
+"Under Armour, Inc. Class C",0.007,UA
+News Corp. Class B,0.006,NWS
