@@ -9,8 +9,18 @@ import pandas as pd
 import os
 import requests
 import yfinance as yf
+import logging
 from functools import lru_cache
 from typing import Tuple
+
+# LOGGING CONFIGURATION
+LOG_LEVEL = logging.INFO  # Change to logging.DEBUG for verbose output
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(levelname)-8s | %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=32)
@@ -43,27 +53,27 @@ def fetch_and_cache_stock_data_factorstoday(
     
     # Load existing cache if available (and non-empty)
     if os.path.exists(cache_file):
-        print(f"Loading existing cache: {cache_file}...")
+        logger.info(f"Loading existing cache: {cache_file}...")
         cached_data = pd.read_csv(cache_file, index_col=0, parse_dates=True)
         # Only use cache if it has data rows; empty cache is corrupted
         if len(cached_data) > 0:
             cached_tickers = set(cached_data.columns)
         else:
-            print(f"  → Cache is empty, will re-download all tickers")
+            logger.info("Cache is empty, will re-download all tickers")
             cached_data = None
     
     # Identify missing tickers
     missing_tickers = [t for t in ticker_list if t not in cached_tickers]
     
     if missing_tickers:
-        print(f"Downloading {len(missing_tickers)}/{len(ticker_list)} missing tickers from factorstoday.com API...")
+        logger.info(f"Downloading {len(missing_tickers)}/{len(ticker_list)} missing tickers from factorstoday.com API...")
         new_data_dict = {}
         
         for ticker in missing_tickers:
             try:
                 # Fetch ALL available data from factorstoday.com API by using a very large 'days' parameter
                 url = f"{api_base_url}/stock-history/{ticker}?days=1000000000"
-                print(f"  Fetching {ticker}...", end=" ")
+                logger.debug(f"Fetching {ticker}...", end=" ")
                 response = requests.get(url, timeout=10)
                 response.raise_for_status()
                 
@@ -76,12 +86,12 @@ def fetch_and_cache_stock_data_factorstoday(
                     df = df[['close']].rename(columns={'close': ticker})
                     new_data_dict[ticker] = df[ticker]
                     date_range = f"{df.index[0].date()} to {df.index[-1].date()}"
-                    print(f"✓ ({len(data)} records, {date_range})")
+                    logger.debug(f"✓ ({len(data)} records, {date_range})")
                 else:
-                    print(f"✗ (no data)")
+                    logger.debug(f"✗ (no data)")
                     new_data_dict[ticker] = pd.Series(dtype=float)
             except Exception as e:
-                print(f"✗ (error: {e})")
+                logger.debug(f"✗ (error: {e})")
                 new_data_dict[ticker] = pd.Series(dtype=float)
         
         # Combine all new data into single DataFrame
@@ -108,17 +118,17 @@ def fetch_and_cache_stock_data_factorstoday(
     # IMPORTANT: Only save cache if we have actual data (not just NaN columns)
     if len(all_data) > 0:
         all_data.to_csv(cache_file)
-        print(f"Cache updated: {cache_file}")
-        print(f"  Date range: {all_data.index[0].date()} to {all_data.index[-1].date()}")
+        logger.info(f"Cache updated: {cache_file}")
+        logger.info(f"Date range: {all_data.index[0].date()} to {all_data.index[-1].date()}")
     else:
-        print(f"WARNING: No data to save to cache (all downloads failed)")
+        logger.warning("No data to save to cache (all downloads failed)")
     
     # Before returning, drop columns that are entirely NaN (failed downloads)
     # These stay in cache for next run, but we don't analyze them
     all_data = all_data.dropna(axis=1, how='all')
     
     if len(all_data) > 0:
-        print(f"Returning data for {len(all_data.columns)} tickers, date range: {all_data.index[0].date()} to {all_data.index[-1].date()}")
+        logger.info(f"Returning data for {len(all_data.columns)} tickers, date range: {all_data.index[0].date()} to {all_data.index[-1].date()}")
     
     return all_data
 
@@ -155,20 +165,20 @@ def fetch_and_cache_stock_data_yfinance(
     
     # Load existing cache if available (and non-empty)
     if os.path.exists(cache_file):
-        print(f"Loading existing cache: {cache_file}...")
+        logger.info(f"Loading existing cache: {cache_file}...")
         cached_data = pd.read_csv(cache_file, index_col=0, parse_dates=True)
         # Only use cache if it has data rows; empty cache is corrupted
         if len(cached_data) > 0:
             cached_tickers = set(cached_data.columns)
         else:
-            print(f"  → Cache is empty, will re-download all tickers")
+            logger.info("Cache is empty, will re-download all tickers")
             cached_data = None
     
     # Identify missing tickers
     missing_tickers = [t for t in ticker_list if t not in cached_tickers]
     
     if missing_tickers:
-        print(f"Downloading {len(missing_tickers)}/{len(ticker_list)} missing tickers using yfinance (all available history)...")
+        logger.info(f"Downloading {len(missing_tickers)}/{len(ticker_list)} missing tickers using yfinance (all available history)...")
         downloaded = yf.download(missing_tickers, period='max', threads=False)
         
         # Extract 'Close' from MultiIndex columns (when multiple tickers)
@@ -199,16 +209,16 @@ def fetch_and_cache_stock_data_yfinance(
     # IMPORTANT: Only save cache if we have actual data (not just NaN columns)
     if len(all_data) > 0:
         all_data.to_csv(cache_file)
-        print(f"Cache updated: {cache_file}")
+        logger.info(f"Cache updated: {cache_file}")
     else:
-        print(f"WARNING: No data to save to cache (all downloads failed)")
+        logger.warning("No data to save to cache (all downloads failed)")
     
     # Before returning, drop columns that are entirely NaN (failed downloads)
     # These stay in cache for next run, but we don't analyze them
     all_data = all_data.dropna(axis=1, how='all')
     
     if len(all_data) > 0:
-        print(f"Returning data for {len(all_data.columns)} tickers, date range: {all_data.index[0].date()} to {all_data.index[-1].date()}")
+        logger.info(f"Returning data for {len(all_data.columns)} tickers, date range: {all_data.index[0].date()} to {all_data.index[-1].date()}")
     
     return all_data
 
@@ -239,8 +249,8 @@ def fetch_and_cache_stock_data(
         DataFrame with Close prices for all requested tickers (excluding failed tickers)
     """
     try:
-        print("Attempting to fetch from factorstoday.com API...")
+        logger.debug("Attempting to fetch from factorstoday.com API...")
         return fetch_and_cache_stock_data_factorstoday(ticker_tuple, cache_file)
     except Exception as e:
-        print(f"⚠ factorstoday.com API failed ({e}), falling back to yfinance...")
+        logger.debug(f"⚠ factorstoday.com API failed ({e}), falling back to yfinance...")
         return fetch_and_cache_stock_data_yfinance(ticker_tuple, cache_file)

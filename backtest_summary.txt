@@ -4,21 +4,21 @@ BACKTEST SUMMARY
 
 PERFORMANCE METRICS
 ----------------------------------------------------------------------
-Total Return:                         2958.30%
-Annualized Return (geometric):          20.97%
-Arithmetic Average Return:              21.08%
-Volatility (annualized):                20.16%
-Volatility Drag:                         2.03%
+Total Return:                         1179.95%
+Annualized Return (geometric):          15.25%
+Arithmetic Average Return:              15.64%
+Volatility (annualized):                17.01%
+Volatility Drag:                         1.45%
 
 RISK-ADJUSTED METRICS
 ----------------------------------------------------------------------
-Sharpe Ratio:                          0.8914
-Sortino Ratio:                         1.2985
-Max Drawdown:                           45.25%
+Sharpe Ratio:                          0.7201
+Sortino Ratio:                         1.0584
+Max Drawdown:                           34.63%
 
 PORTFOLIO VALUES
 ----------------------------------------------------------------------
 Initial Capital:                 $  100,000.00
-Final Portfolio Value:           $3,058,302.05
+Final Portfolio Value:           $1,279,953.02
 
 ======================================================================

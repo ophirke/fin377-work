@@ -6,15 +6,31 @@ period, allocating long positions to peripheral stocks and short positions to
 core stocks. Tracks daily portfolio values and outputs results to Excel with visualizations.
 """
 
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from datetime import timedelta
-from typing import List, Optional, Tuple, Dict
+import argparse
+import logging
 import os
+from datetime import timedelta
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
 import rossa
 from factor import compute_factor_loadings, load_factor_data
+
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+
+LOG_LEVEL = logging.INFO  # Change to logging.DEBUG for verbose output
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(levelname)-8s | %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
 
 RF_RATE = 0.03
 
@@ -73,7 +89,7 @@ def allocate_by_coreness(results_df: pd.DataFrame) -> pd.DataFrame:
     is_core = results_df_without_IWM["Coreness"] >= coreness_threshold
     n_core = is_core.sum()
     n_peripheral = (~is_core).sum()
-    print(
+    logger.info(
         f"  → {n_peripheral} peripheral stocks (bottom {quantile_prop * 100:.0f}%), {n_core} core stocks (top {(1 - quantile_prop) * 100:.0f}%) at coreness threshold {coreness_threshold:.4f}"
     )
 
@@ -96,7 +112,9 @@ def allocate_by_coreness(results_df: pd.DataFrame) -> pd.DataFrame:
 
     # Sort by coreness ascending (rank 1 = lowest coreness = most peripheral)
     allocations_df = pd.DataFrame(allocations)
-    allocations_df = allocations_df.sort_values("Coreness", ascending=True).reset_index(drop=True)
+    allocations_df = allocations_df.sort_values("Coreness", ascending=True).reset_index(
+        drop=True
+    )
     allocations_df["Coreness_Rank"] = range(1, len(allocations_df) + 1)
 
     return allocations_df
@@ -129,7 +147,7 @@ def get_rebalance_allocations(
         # (don't use today's data to make today's trades)
         analysis_end_date = rebalance_date - timedelta(days=1)
 
-        print(
+        logger.info(
             f"\nRebalance on {rebalance_date.date()}: lookback [{lookback_start.date()} to {analysis_end_date.date()}]"
         )
 
@@ -153,7 +171,7 @@ def get_rebalance_allocations(
 
         rebalance_allocations[rebalance_date] = allocations
 
-        print(f"  → {len(allocations)} stocks allocated")
+        logger.info(f"  → {len(allocations)} stocks allocated")
 
     return rebalance_allocations
 
@@ -349,6 +367,21 @@ def calculate_portfolio_metrics(
     # Calculate performance metrics
     daily_returns = portfolio_summary["Daily_Return"].dropna()
 
+    # Guard against insufficient data
+    if len(daily_returns) == 0:
+        logger.warning("No valid daily returns. Returning zeros for all metrics.")
+        summary_stats = {
+            "Total_Return": 0.0,
+            "Annualized_Return": 0.0,
+            "Arithmetic_Annual_Return": 0.0,
+            "Volatility": 0.0,
+            "Volatility_Drag": 0.0,
+            "Sharpe_Ratio": 0.0,
+            "Sortino_Ratio": 0.0,
+            "Max_Drawdown": 0.0,
+        }
+        return portfolio_summary, summary_stats
+
     # Total return
     total_return = portfolio_summary["Cumulative_Return"].iloc[-1]
 
@@ -382,7 +415,7 @@ def calculate_portfolio_metrics(
     # Downside volatility uses semi-deviation: sqrt(mean(min(r - target, 0)²)) over full N
     target = 0.0
     downside_diff = np.minimum(daily_returns - target, 0.0)
-    downside_volatility = np.sqrt((downside_diff ** 2).mean())
+    downside_volatility = np.sqrt((downside_diff**2).mean())
     downside_volatility_annual = downside_volatility * np.sqrt(252)
     sortino_ratio = (
         annual_return_excess / downside_volatility_annual
@@ -442,11 +475,11 @@ def export_to_excel(
         else 0
     )
 
-    print("\n[DEBUG] Export integrity check:")
-    print(f"  Last date: {last_date.date()}")
-    print(f"  Holdings on last date: {num_holdings} stocks")
-    print(f"  Final portfolio value: ${last_portfolio_value:,.2f}")
-    print(f"  Total daily records: {len(daily_holdings)}")
+    logger.debug("Export integrity check:")
+    logger.debug(f"  Last date: {last_date.date()}")
+    logger.debug(f"  Holdings on last date: {num_holdings} stocks")
+    logger.debug(f"  Final portfolio value: ${last_portfolio_value:,.2f}")
+    logger.debug(f"  Total daily records: {len(daily_holdings)}")
 
     with pd.ExcelWriter(output_filename, engine="openpyxl") as writer:
         # Sheet 1: Daily Holdings
@@ -504,7 +537,7 @@ def export_to_excel(
         rebalance_df = pd.DataFrame(rebalance_events)
         rebalance_df.to_excel(writer, sheet_name="Rebalance Events", index=False)
 
-    print(f"\nExcel report exported: {output_filename}")
+    logger.info(f"Excel report exported: {output_filename}")
 
 
 def plot_backtest_results(
@@ -569,7 +602,7 @@ def plot_backtest_results(
     plt.tight_layout()
     output_file = os.path.join(output_dir, "backtest_plots.png")
     plt.savefig(output_file, dpi=150, bbox_inches="tight")
-    print(f"Plots saved: {output_file}")
+    logger.info(f"Plots saved: {output_file}")
     plt.close()
 
 
@@ -633,7 +666,7 @@ def export_summary_txt(
 
         f.write("=" * 70 + "\n")
 
-    print(f"Summary exported: {output_filename}")
+    logger.info(f"Summary exported: {output_filename}")
 
 
 def compute_factor_loadings_over_time(
@@ -645,63 +678,67 @@ def compute_factor_loadings_over_time(
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Compute factor loadings at each rebalance date using a rolling lookback window.
-    
+
     For each rebalance date, calculates portfolio returns for the lookback period
     and computes factor exposures via OLS regression.
-    
+
     Args:
         portfolio_summary: DataFrame from calculate_portfolio_metrics with daily returns
         rebalance_dates: List of rebalance dates
         factor_lookback_days: Number of days to look back for factor analysis
         factor_list: Optional list of factor names; if None, uses all available factors
         factor_data_file: Path to Excel file with factor returns
-    
+
     Returns:
         Tuple of (factor_loadings_df, rsquared_series)
         - factor_loadings_df: Each row is a rebalance date, columns are factors
         - rsquared_series: R² value for each rebalance date
     """
-    print("\n" + "=" * 70)
-    print("FACTOR ANALYSIS: COMPUTING LOADINGS AT EACH REBALANCE")
-    print("=" * 70)
-    print(f"Lookback period: {factor_lookback_days} days")
-    print(f"Rebalance dates: {len(rebalance_dates)}")
-    print(f"Factor data file: {factor_data_file}")
-    
+    logger.info("=" * 70)
+    logger.info("FACTOR ANALYSIS: COMPUTING LOADINGS AT EACH REBALANCE")
+    logger.info("=" * 70)
+    logger.info(f"Lookback period: {factor_lookback_days} days")
+    logger.info(f"Rebalance dates: {len(rebalance_dates)}")
+    logger.info(f"Factor data file: {factor_data_file}")
+
     # Load factor data
     try:
         factor_returns = load_factor_data(factor_data_file, sheet_name=0)
     except FileNotFoundError:
-        print(f"WARNING: Factor data file not found: {factor_data_file}")
-        print("Skipping factor analysis.")
+        logger.warning(f"Factor data file not found: {factor_data_file}")
+        logger.warning("Skipping factor analysis.")
         return None, None
-    
+
     # Store loadings and R² for each rebalance
     loadings_records = []
     rsquared_values = []
     rebalance_dates_list = []
-    
+
     for rebalance_date in rebalance_dates:
         # Calculate lookback window
         lookback_start = rebalance_date - timedelta(days=factor_lookback_days)
-        
+
         # Get portfolio returns for the lookback period
         port_ret_window = portfolio_summary[
-            (portfolio_summary["Date"] >= lookback_start) &
-            (portfolio_summary["Date"] <= rebalance_date)
+            (portfolio_summary["Date"] >= lookback_start)
+            & (portfolio_summary["Date"] <= rebalance_date)
         ].copy()
-        
+
         if len(port_ret_window) < 10:
-            print(f"  {rebalance_date.date()}: Skipped (insufficient data: {len(port_ret_window)} days)")
+            logger.debug(
+                f"  {rebalance_date.date()}: Skipped (insufficient data: {len(port_ret_window)} days)"
+            )
             continue
-        
+
         port_ret_window = port_ret_window.sort_values("Date").set_index("Date")
         portfolio_returns_series = port_ret_window["Daily_Return"].dropna()
-        
+
         if len(portfolio_returns_series) < 10:
-            print(f"  {rebalance_date.date()}: Skipped (insufficient returns: {len(portfolio_returns_series)} days)")
+            logger.debug(
+                f"  {rebalance_date.date()}: Skipped (insufficient returns: {len(portfolio_returns_series)} days)"
+            )
             continue
-        
+
         # Compute factor loadings for this window
         try:
             loadings_df, diagnostics = compute_factor_loadings(
@@ -712,60 +749,65 @@ def compute_factor_loadings_over_time(
                 confidence_threshold=0.95,
                 min_factor_coverage=0.7,  # Allow factors with 70%+ coverage
             )
-            
+
             # Extract loadings as a dict
             loading_dict = dict(zip(loadings_df["Factor"], loadings_df["Loading"]))
             loading_dict["Rebalance_Date"] = rebalance_date
             loadings_records.append(loading_dict)
             rsquared_values.append(diagnostics["r_squared"])
             rebalance_dates_list.append(rebalance_date)
-            
-            print(f"  {rebalance_date.date()}: R²={diagnostics['r_squared']:.4f}, {len(loadings_df)} factors")
-            
+
+            logger.info(
+                f"  {rebalance_date.date()}: R²={diagnostics['r_squared']:.4f}, {len(loadings_df)} factors"
+            )
+
         except Exception as e:
-            print(f"  {rebalance_date.date()}: Error - {str(e)}")
+            logger.error(f"  {rebalance_date.date()}: Error - {str(e)}")
             continue
-    
+
     if not loadings_records:
-        print("WARNING: No factor loadings computed. Skipping factor analysis.")
+        logger.warning("No factor loadings computed. Skipping factor analysis.")
         return None, None
-    
+
     # Convert to DataFrames (keep NaN for non-significant factors in each window)
     # Do NOT fillna(0) — NaN represents "not significant in this window", not zero loading
     factor_loadings_df = pd.DataFrame(loadings_records)
-    
+
     # Filter to factors that appeared in at least 10% of windows (meaningful signal)
     min_appearances = int(0.1 * len(factor_loadings_df))
     factor_loadings_df = factor_loadings_df.dropna(axis=1, thresh=min_appearances)
-    
+
     rsquared_series = pd.Series(rsquared_values, index=rebalance_dates_list)
-    
-    print(f"\nFactor loadings computed for {len(factor_loadings_df)} rebalance dates")
-    print(f"Factors with ≥10% appearance frequency: {len(factor_loadings_df.columns) - 1}")  # -1 for Rebalance_Date
-    
+
+    logger.info(
+        f"Factor loadings computed for {len(factor_loadings_df)} rebalance dates"
+    )
+    logger.info(
+        f"Factors with ≥10% appearance frequency: {len(factor_loadings_df.columns) - 1}"
+    )  # -1 for Rebalance_Date
+
     return factor_loadings_df, rsquared_series
 
 
 def plot_factor_loadings_multiline(
-    factor_loadings_df: pd.DataFrame,
-    output_file: str = "factor_loadings_multiline.png"
+    factor_loadings_df: pd.DataFrame, output_file: str = "factor_loadings_multiline.png"
 ) -> None:
     """
     Plot factor loadings over time as a multiline chart (all factors on one chart).
-    
+
     NaN values represent periods where the factor was not statistically significant
     and will appear as discontinuous lines.
-    
+
     Args:
         factor_loadings_df: DataFrame from compute_factor_loadings_over_time
         output_file: Output PNG filename
     """
     plt.figure(figsize=(14, 7))
-    
+
     # Drop Rebalance_Date column and plot
     df_plot = factor_loadings_df.drop(columns=["Rebalance_Date"], errors="ignore")
     dates = factor_loadings_df["Rebalance_Date"]
-    
+
     for col in df_plot.columns:
         # Market factor gets emphasis; others get muted
         if col == "Market":
@@ -774,91 +816,111 @@ def plot_factor_loadings_multiline(
         else:
             alpha = 0.6
             lw = 1.5
-        
-        plt.plot(dates, df_plot[col], marker='o', label=col, linewidth=lw, 
-                 markersize=3, alpha=alpha)
-    
+
+        plt.plot(
+            dates,
+            df_plot[col],
+            marker="o",
+            label=col,
+            linewidth=lw,
+            markersize=3,
+            alpha=alpha,
+        )
+
     plt.title("Factor Loadings Over Time (All Factors)", fontsize=14, fontweight="bold")
     plt.xlabel("Rebalance Date")
     plt.ylabel("Loading")
     plt.legend(loc="upper right", fontsize=8, ncol=2, framealpha=0.9)
     plt.grid(True, alpha=0.3)
-    plt.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=0.5)
+    plt.axhline(y=0, color="black", linestyle="-", alpha=0.3, linewidth=0.5)
     plt.xticks(rotation=45)
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches="tight")
-    print(f"Multiline factor plot saved: {output_file}")
+    logger.info(f"Multiline factor plot saved: {output_file}")
     plt.close()
 
 
 def plot_factor_loadings_subplots(
-    factor_loadings_df: pd.DataFrame,
-    output_file: str = "factor_loadings_subplots.png"
+    factor_loadings_df: pd.DataFrame, output_file: str = "factor_loadings_subplots.png"
 ) -> None:
     """
     Plot factor loadings over time as subplots (one chart per factor).
-    
+
     NaN values represent periods where the factor was not statistically significant.
     These appear as gaps in the line (honest representation of data availability).
-    
+
     Args:
         factor_loadings_df: DataFrame from compute_factor_loadings_over_time
         output_file: Output PNG filename
     """
     df_plot = factor_loadings_df.drop(columns=["Rebalance_Date"], errors="ignore")
     dates = factor_loadings_df["Rebalance_Date"]
-    
+
     n_factors = len(df_plot.columns)
     n_cols = 3
     n_rows = (n_factors + n_cols - 1) // n_cols
-    
+
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 4 * n_rows))
     axes = axes.flatten()
-    
+
     for idx, col in enumerate(df_plot.columns):
         ax = axes[idx]
-        ax.plot(dates, df_plot[col], marker='o', linewidth=2, markersize=4, color='steelblue')
-        
+        ax.plot(
+            dates,
+            df_plot[col],
+            marker="o",
+            linewidth=2,
+            markersize=4,
+            color="steelblue",
+        )
+
         # Fill between only where data exists (skip NaN gaps)
         valid_mask = df_plot[col].notna()
-        ax.fill_between(dates[valid_mask], df_plot[col][valid_mask], 0, 
-                        alpha=0.3, color='steelblue')
-        
+        ax.fill_between(
+            dates[valid_mask], df_plot[col][valid_mask], 0, alpha=0.3, color="steelblue"
+        )
+
         ax.set_title(f"{col}", fontsize=12, fontweight="bold")
         ax.set_xlabel("Rebalance Date")
         ax.set_ylabel("Loading")
         ax.grid(True, alpha=0.3)
-        ax.axhline(y=0, color='red', linestyle='--', alpha=0.5)
-        ax.tick_params(axis='x', rotation=45)
-    
+        ax.axhline(y=0, color="red", linestyle="--", alpha=0.5)
+        ax.tick_params(axis="x", rotation=45)
+
     # Hide unused subplots
     for idx in range(len(df_plot.columns), len(axes)):
         axes[idx].set_visible(False)
-    
+
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches="tight")
-    print(f"Subplot factor plot saved: {output_file}")
+    logger.info(f"Subplot factor plot saved: {output_file}")
     plt.close()
 
 
 def plot_factor_rsquared(
-    rsquared_series: pd.Series,
-    output_file: str = "factor_rsquared.png"
+    rsquared_series: pd.Series, output_file: str = "factor_rsquared.png"
 ) -> None:
     """
     Plot R² values for factor models over time.
-    
+
     Args:
         rsquared_series: Series from compute_factor_loadings_over_time
         output_file: Output PNG filename
     """
     plt.figure(figsize=(14, 6))
-    
-    plt.plot(rsquared_series.index, rsquared_series.values, 
-             marker='o', linewidth=2, markersize=6, color='darkgreen')
-    plt.fill_between(rsquared_series.index, rsquared_series.values, 0, 
-                     alpha=0.3, color='green')
-    
+
+    plt.plot(
+        rsquared_series.index,
+        rsquared_series.values,
+        marker="o",
+        linewidth=2,
+        markersize=6,
+        color="darkgreen",
+    )
+    plt.fill_between(
+        rsquared_series.index, rsquared_series.values, 0, alpha=0.3, color="green"
+    )
+
     plt.title("Factor Model R² Over Time", fontsize=14, fontweight="bold")
     plt.xlabel("Rebalance Date")
     plt.ylabel("R²")
@@ -867,18 +929,18 @@ def plot_factor_rsquared(
     plt.xticks(rotation=45)
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches="tight")
-    print(f"R² plot saved: {output_file}")
+    logger.info(f"R² plot saved: {output_file}")
     plt.close()
 
 
 def export_factor_analysis_to_excel(
     factor_loadings_df: pd.DataFrame,
     rsquared_series: pd.Series,
-    output_filename: str = "factor_analysis.xlsx"
+    output_filename: str = "factor_analysis.xlsx",
 ) -> None:
     """
     Export factor analysis results to Excel.
-    
+
     Args:
         factor_loadings_df: DataFrame from compute_factor_loadings_over_time
         rsquared_series: Series from compute_factor_loadings_over_time
@@ -886,21 +948,25 @@ def export_factor_analysis_to_excel(
     """
     if factor_loadings_df is None:
         return
-    
+
     with pd.ExcelWriter(output_filename, engine="openpyxl") as writer:
         # Sheet 1: Factor Loadings
         loadings_export = factor_loadings_df.copy()
-        loadings_export["Rebalance_Date"] = loadings_export["Rebalance_Date"].dt.strftime("%Y-%m-%d")
+        loadings_export["Rebalance_Date"] = loadings_export[
+            "Rebalance_Date"
+        ].dt.strftime("%Y-%m-%d")
         loadings_export.to_excel(writer, sheet_name="Factor Loadings", index=False)
-        
+
         # Sheet 2: R² Values
-        rsq_export = pd.DataFrame({
-            "Rebalance_Date": rsquared_series.index.strftime("%Y-%m-%d"),
-            "R_Squared": rsquared_series.values
-        })
+        rsq_export = pd.DataFrame(
+            {
+                "Rebalance_Date": rsquared_series.index.strftime("%Y-%m-%d"),
+                "R_Squared": rsquared_series.values,
+            }
+        )
         rsq_export.to_excel(writer, sheet_name="R_Squared", index=False)
-    
-    print(f"Factor analysis exported: {output_filename}")
+
+    logger.info(f"Factor analysis exported: {output_filename}")
 
 
 def run_backtest(
@@ -915,6 +981,7 @@ def run_backtest(
     factor_list: Optional[List[str]] = None,
     factor_lookback_days: Optional[int] = None,
     factor_data_file: str = "factor_returns.xlsx",
+    summary_file: str = "backtest_summary.txt",
 ) -> pd.DataFrame:
     """
     Run complete backtest of core-periphery strategy.
@@ -931,50 +998,50 @@ def run_backtest(
         factor_list: Optional list of factor names for factor analysis (None = use all)
         factor_lookback_days: Optional number of days for factor lookback window
         factor_data_file: Path to Excel file with factor returns
-
+        summary_file: Path to text file for summary output
     Returns:
         Portfolio summary DataFrame
     """
-    print("\n" + "=" * 70)
-    print("BACKTEST: CORE-PERIPHERY STRATEGY")
-    print("=" * 70)
-    print(f"Backtest period: {start_backtest_date} to {end_backtest_date}")
-    print(f"Lookback period: {lookback_days} days")
-    print(f"Rebalance interval: {rebalance_interval_days} days")
-    print(f"Tickers: {len(ticker_list)}")
+    logger.info("=" * 70)
+    logger.info("BACKTEST: CORE-PERIPHERY STRATEGY")
+    logger.info("=" * 70)
+    logger.info(f"Backtest period: {start_backtest_date} to {end_backtest_date}")
+    logger.info(f"Lookback period: {lookback_days} days")
+    logger.info(f"Rebalance interval: {rebalance_interval_days} days")
+    logger.info(f"Tickers: {len(ticker_list)}")
 
     # Step 1: Fetch price data
-    print("\n[1/5] Fetching price data...")
+    logger.info("[1/6] Fetching price data...")
     # Convert list to tuple for caching
     price_data = rossa.fetch_and_cache_stock_data(tuple(ticker_list), cache_file)
 
     # Verify data covers the required backtest period
     actual_start = price_data.index[0]
     actual_end = price_data.index[-1]
-    print(f"Data covers period: {actual_start.date()} to {actual_end.date()}")
-    print(f"Backtest will use: {start_backtest_date} to {end_backtest_date}")
+    logger.info(f"Data covers period: {actual_start.date()} to {actual_end.date()}")
+    logger.info(f"Backtest will use: {start_backtest_date} to {end_backtest_date}")
 
     # Step 2: Generate rebalance dates
-    print("[2/5] Generating rebalance schedule...")
+    logger.info("[2/6] Generating rebalance schedule...")
     rebalance_dates = generate_rebalance_dates(
         start_backtest_date, end_backtest_date, rebalance_interval_days
     )
-    print(f"  → {len(rebalance_dates)} rebalance dates generated")
+    logger.info(f"  → {len(rebalance_dates)} rebalance dates generated")
 
     # Step 3: Compute allocations for each rebalance
-    print("[3/5] Computing allocations for each rebalance...")
+    logger.info("[3/6] Computing allocations for each rebalance...")
     rebalance_schedule = get_rebalance_allocations(
         ticker_list, rebalance_dates, lookback_days, cache_file
     )
 
     # Step 4: Calculate daily portfolio values
-    print("[4/5] Calculating daily portfolio values...")
+    logger.info("[4/6] Calculating daily portfolio values...")
     daily_holdings = calculate_portfolio_daily_values(
         price_data, rebalance_schedule, start_backtest_date, end_backtest_date
     )
 
     # Step 5: Calculate metrics and export
-    print("[5/6] Generating reports...")
+    logger.info("[5/6] Generating reports...")
     portfolio_summary, summary_stats = calculate_portfolio_metrics(daily_holdings)
 
     # Export Excel
@@ -988,40 +1055,22 @@ def run_backtest(
         )
 
     # Export summary text file
-    summary_filename = "backtest_summary.txt"
-    export_summary_txt(summary_stats, portfolio_summary, summary_filename)
+    if summary_file is not None:
+        export_summary_txt(summary_stats, portfolio_summary, summary_file)
 
     # Generate plots
     if output_plots:
         plot_backtest_results(portfolio_summary)
 
     # Print summary statistics
-    print("\n" + "-" * 70)
-    print("BACKTEST SUMMARY")
-    print("-" * 70)
-    print(f"Total Return: {summary_stats['Total_Return'] * 100:.2f}%")
-    print(
-        f"Annualized Return (geometric): {summary_stats['Annualized_Return'] * 100:.2f}%"
-    )
-    print(
-        f"Arithmetic Average Return (annualized): {summary_stats['Arithmetic_Annual_Return'] * 100:.2f}%"
-    )
-    print(f"Volatility (annualized): {summary_stats['Volatility'] * 100:.2f}%")
-    print(f"Volatility Drag: {summary_stats['Volatility_Drag'] * 100:.2f}%")
-    print(f"Sharpe Ratio: {summary_stats['Sharpe_Ratio']:.4f}")
-    print(f"Sortino Ratio: {summary_stats['Sortino_Ratio']:.4f}")
-    print(f"Max Drawdown: {summary_stats['Max_Drawdown'] * 100:.2f}%")
-    print(
-        f"Final Portfolio Value: ${portfolio_summary['Portfolio_Value'].iloc[-1]:.2f}"
-    )
-    print("=" * 70 + "\n")
+    print_backtest_summary(summary_stats, portfolio_summary)
 
     # Step 6: Factor analysis (if requested)
     factor_loadings_df = None
     rsquared_series = None
-    
+
     if factor_lookback_days is not None and factor_lookback_days > 0:
-        print("[6/6] Computing factor analysis...")
+        logger.info("[6/6] Computing factor analysis...")
         factor_loadings_df, rsquared_series = compute_factor_loadings_over_time(
             portfolio_summary=portfolio_summary,
             rebalance_dates=rebalance_dates,
@@ -1029,70 +1078,215 @@ def run_backtest(
             factor_list=factor_list,
             factor_data_file=factor_data_file,
         )
-        
+
         if factor_loadings_df is not None:
             # Plot factor loadings
-            plot_factor_loadings_multiline(factor_loadings_df, "factor_loadings_multiline.png")
-            plot_factor_loadings_subplots(factor_loadings_df, "factor_loadings_subplots.png")
+            plot_factor_loadings_multiline(
+                factor_loadings_df, "factor_loadings_multiline.png"
+            )
+            plot_factor_loadings_subplots(
+                factor_loadings_df, "factor_loadings_subplots.png"
+            )
             plot_factor_rsquared(rsquared_series, "factor_rsquared.png")
-            
+
             # Export to Excel
             export_factor_analysis_to_excel(
                 factor_loadings_df, rsquared_series, "factor_analysis.xlsx"
             )
-            
+
             # Print summary of most recent loadings
-            print("\n" + "-" * 70)
-            print("MOST RECENT FACTOR LOADINGS (Latest Rebalance)")
-            print("-" * 70)
+            logger.info("-" * 70)
+            logger.info("MOST RECENT FACTOR LOADINGS (Latest Rebalance)")
+            logger.info("-" * 70)
             most_recent_idx = len(factor_loadings_df) - 1
             most_recent_row = factor_loadings_df.iloc[most_recent_idx]
             most_recent_date = most_recent_row["Rebalance_Date"]
             most_recent_rsq = rsquared_series.iloc[most_recent_idx]
-            
-            print(f"Date: {most_recent_date.date()}")
-            print(f"R²: {most_recent_rsq:.4f}")
-            print("\nFactor Loadings:")
+
+            logger.info(f"Date: {most_recent_date.date()}")
+            logger.info(f"R²: {most_recent_rsq:.4f}")
+            logger.info("Factor Loadings:")
             for col in factor_loadings_df.columns:
                 if col != "Rebalance_Date":
                     loading = most_recent_row[col]
-                    print(f"  {col:20s}: {loading:>10.6f}")
-            print("=" * 70 + "\n")
+                    logger.info(f"  {col:20s}: {loading:>10.6f}")
+            logger.info("=" * 70)
 
-    return portfolio_summary
+    return portfolio_summary, summary_stats
+
+
+def print_backtest_summary(
+    summary_stats: Dict, portfolio_summary: pd.DataFrame
+) -> None:
+    logger.info("-" * 70)
+    logger.info("BACKTEST SUMMARY")
+    logger.info("-" * 70)
+    logger.info(f"Total Return: {summary_stats['Total_Return'] * 100:.2f}%")
+    logger.info(
+        f"Annualized Return (geometric): {summary_stats['Annualized_Return'] * 100:.2f}%"
+    )
+    logger.info(
+        f"Arithmetic Average Return (annualized): {summary_stats['Arithmetic_Annual_Return'] * 100:.2f}%"
+    )
+    logger.info(f"Volatility (annualized): {summary_stats['Volatility'] * 100:.2f}%")
+    logger.info(f"Volatility Drag: {summary_stats['Volatility_Drag'] * 100:.2f}%")
+    logger.info(f"Sharpe Ratio: {summary_stats['Sharpe_Ratio']:.4f}")
+    logger.info(f"Sortino Ratio: {summary_stats['Sortino_Ratio']:.4f}")
+    logger.info(f"Max Drawdown: {summary_stats['Max_Drawdown'] * 100:.2f}%")
+    logger.info(
+        f"Final Portfolio Value: ${portfolio_summary['Portfolio_Value'].iloc[-1]:.2f}"
+    )
+    logger.info("=" * 70)
+
+
+def plot_backtest_summary_over_time(
+    summary_stats_over_time: List[Dict], output_file: str = "summary_over_time.png"
+) -> None:
+    """
+    Plot summary statistics over time (e.g. annualized return, volatility, Sharpe).
+
+    Args:
+        summary_stats_over_time: List of summary stats dicts for each period
+        output_file: Output PNG filename
+    """
+    if not summary_stats_over_time:
+        logger.warning("No summary stats to plot.")
+        return
+
+    # Convert list of dicts to DataFrame
+    summary_df = pd.DataFrame(summary_stats_over_time)
+
+    # Ensure Date column is datetime
+    if "Date" in summary_df.columns:
+        summary_df["Date"] = pd.to_datetime(summary_df["Date"])
+        summary_df = summary_df.sort_values("Date")
+    else:
+        logger.warning("No 'Date' column in summary stats. Cannot plot over time.")
+        return
+
+    if len(summary_df) < 2:
+        logger.warning("Not enough data points to plot.")
+        return
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+
+    # Plot 1: Annualized Return
+    axes[0].plot(
+        summary_df["Date"],
+        summary_df["Annualized_Return"] * 100,
+        marker="o",
+        linewidth=2,
+        markersize=6,
+        color="blue",
+    )
+    axes[0].set_title("Annualized Return Over Time", fontsize=12, fontweight="bold")
+    axes[0].set_ylabel("Return (%)")
+    axes[0].grid(True, alpha=0.3)
+
+    # Plot 2: Volatility
+    axes[1].plot(
+        summary_df["Date"],
+        summary_df["Volatility"] * 100,
+        marker="o",
+        linewidth=2,
+        markersize=6,
+        color="orange",
+    )
+    axes[1].set_title("Volatility Over Time", fontsize=12, fontweight="bold")
+    axes[1].set_ylabel("Volatility (%)")
+    axes[1].grid(True, alpha=0.3)
+
+    # Plot 3: Sharpe Ratio
+    axes[2].plot(
+        summary_df["Date"],
+        summary_df["Sharpe_Ratio"],
+        marker="o",
+        linewidth=2,
+        markersize=6,
+        color="green",
+    )
+    axes[2].set_title("Sharpe Ratio Over Time", fontsize=12, fontweight="bold")
+    axes[2].set_xlabel("Date")
+    axes[2].set_ylabel("Sharpe Ratio")
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150, bbox_inches="tight")
+    logger.info(f"Summary over time plot saved: {output_file}")
+    plt.close()
 
 
 def main() -> None:
-    """
-    Main entry point. Load tickers and run backtest.
-    """
     # Load tickers from file
     if not os.path.exists("tickers.txt"):
-        print("Error: tickers.txt not found")
+        logger.error("tickers.txt not found")
         return
 
     with open("tickers.txt", "r") as f:
         ticker_list = [line.strip() for line in f if line.strip()]
 
-    print(f"Loaded {len(ticker_list)} tickers from tickers.txt")
+    logger.info(f"Loaded {len(ticker_list)} tickers from tickers.txt")
+
+    # =================== PARAMS ==================
+    
+    lookback_days = 365
+    rebalance_interval_days = 3
+    
+    # =================== PARAMS ==================
 
     # Run backtest with default parameters
-    # 5 year backtest, 6-month lookback, monthly (21-day) rebalance
-    # Factor analysis: 6-month lookback, all factors
-    results = run_backtest(
+    overall_start_date = "2008-04-13"
+    overall_end_date = "2026-04-13"
+    eval_lookback = pd.DateOffset(years=1)
+    eval_interval = pd.DateOffset(months=1)
+    last_eval_end_date = pd.to_datetime(overall_end_date)
+    last_eval_start_date = last_eval_end_date - eval_lookback + pd.DateOffset(days=1)
+    eval_date_pairs = [(last_eval_start_date, last_eval_end_date)]
+    while eval_date_pairs[-1][0] > pd.to_datetime(overall_start_date):
+        prev_start = eval_date_pairs[-1][0] - eval_interval
+        prev_end = eval_date_pairs[-1][1] - eval_interval
+        eval_date_pairs.append((prev_start, prev_end))
+
+    portfolio_summary_over_time = []
+    summary_stats_over_time = []
+    for sub_start, sub_end in reversed(eval_date_pairs):
+        portfolio_summary, summary_stats = run_backtest(
+            ticker_list=ticker_list,
+            start_backtest_date=sub_start,
+            end_backtest_date=sub_end,
+            lookback_days=lookback_days,
+            rebalance_interval_days=rebalance_interval_days,
+            cache_file="india_stocks_history.csv",
+            output_excel=None,
+            output_plots=False,
+            factor_list=None,
+            factor_lookback_days=None,
+            factor_data_file="factor_returns.xlsx",
+            summary_file=None,
+        )
+        # Add date to summary stats for tracking
+        summary_stats["Date"] = pd.to_datetime(sub_start)
+        portfolio_summary_over_time.append(portfolio_summary)
+        summary_stats_over_time.append(summary_stats)
+
+    plot_backtest_summary_over_time(summary_stats_over_time, "summary_over_time.png")
+
+    full_portfolio_summary, full_summary_stats = run_backtest(
         ticker_list=ticker_list,
         start_backtest_date="2008-04-13",
         end_backtest_date="2026-04-13",
-        lookback_days=126,  # ~6 months
-        rebalance_interval_days=21,  # ~monthly
+        lookback_days=lookback_days,
+        rebalance_interval_days=rebalance_interval_days,
         cache_file="india_stocks_history.csv",
         # output_excel="backtest_results.xlsx",
         output_excel=None,
         output_plots=True,
         factor_list=None,  # Use all available factors
-        factor_lookback_days=756,
+        factor_lookback_days=365 * 3,
         factor_data_file="factor_returns.xlsx",
     )
+    
+    print_backtest_summary(full_summary_stats, full_portfolio_summary)
 
 
 if __name__ == "__main__":

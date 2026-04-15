@@ -9,8 +9,18 @@ import networkx as nx
 from matplotlib.lines import Line2D
 from typing import Optional, List, Tuple
 import requests
+import logging
 
 from data import fetch_and_cache_stock_data
+
+# LOGGING CONFIGURATION
+LOG_LEVEL = logging.INFO  # Change to logging.DEBUG for verbose output
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(levelname)-8s | %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 
 def prepare_price_data(
@@ -52,7 +62,7 @@ def prepare_price_data(
     
     dropped_tickers = initial_tickers - price_data.shape[1]
     if dropped_tickers > 0:
-        print(f"  Dropped {dropped_tickers} stocks with >{missing_tolerance*100:.0f}% missing data")
+        logger.info(f"  Dropped {dropped_tickers} stocks with >{missing_tolerance*100:.0f}% missing data")
     
     # Fill small gaps (trading halts, holidays) forward, then backward
     price_data = price_data.ffill().bfill()
@@ -61,14 +71,14 @@ def prepare_price_data(
     price_data = price_data.dropna()
     
     if price_data.empty or price_data.shape[1] < 2:
-        print(f"  ERROR: Only {price_data.shape[1]} stocks remain with overlapping data")
+        logger.error(f"  ERROR: Only {price_data.shape[1]} stocks remain with overlapping data")
         raise ValueError("Not enough overlapping historical data to build a network")
     
     # Calculate log returns
     log_returns = np.log(price_data / price_data.shift(1)).dropna()
     
-    print(f"  → Analyzing {log_returns.shape[1]} stocks over {log_returns.shape[0]} trading days")
-    print(f"  → Date range: {price_data.index[0].date()} to {price_data.index[-1].date()}")
+    logger.info(f"  → Analyzing {log_returns.shape[1]} stocks over {log_returns.shape[0]} trading days")
+    logger.info(f"  → Date range: {price_data.index[0].date()} to {price_data.index[-1].date()}")
     
     return price_data, log_returns
 
@@ -296,7 +306,7 @@ def plot_network(
     ax.axis('off')
     plt.tight_layout()
     plt.savefig(filename, dpi=150, bbox_inches='tight')
-    print(f"Visualization saved: {filename}")
+    logger.info(f"Visualization saved: {filename}")
     plt.close()
 
 
@@ -328,16 +338,16 @@ def analyze_core_periphery(
         DataFrame with columns ['Stock', 'Coreness'] sorted by coreness score.
         Higher coreness = more central/core. Lower coreness = more peripheral.
     """
-    print("\n" + "="*60)
-    print("CORE-PERIPHERY ANALYSIS")
-    print("="*60)
+    logger.info("\n" + "="*60)
+    logger.info("CORE-PERIPHERY ANALYSIS")
+    logger.info("="*60)
     
     # Fetch and cache price data
-    print(f"\nFetching data for {len(ticker_list)} tickers...")
+    logger.info(f"\nFetching data for {len(ticker_list)} tickers...")
     price_data = fetch_and_cache_stock_data(tuple(ticker_list), cache_file)
     
     # Prepare data for analysis period
-    print("\nPreparing price data...")
+    logger.info("\nPreparing price data...")
     price_data, log_returns = prepare_price_data(
         price_data,
         start_date=price_history_start_date,
@@ -345,28 +355,28 @@ def analyze_core_periphery(
     )
     
     # Build correlation matrix
-    print("Building correlation network...")
+    logger.info("Building correlation network...")
     A, ticker_names = build_adjacency_matrix(log_returns)
     
     # Identify core-periphery structure
-    print("Computing core-periphery decomposition...")
+    logger.info("Computing core-periphery decomposition...")
     results = rossa_core_periphery(A, ticker_names)
     
     # Print results
-    print("\n" + "-"*60)
-    print("RESULTS")
-    print("-"*60)
-    print("\nTOP 5 PERIPHERAL STOCKS (Coreness Ascending):")
-    print(results.head(5).to_string(index=False))
-    print("\nTOP 5 CORE STOCKS (Coreness Descending):")
-    print(results.tail(5).to_string(index=False))
+    logger.info("\n" + "-"*60)
+    logger.info("RESULTS")
+    logger.info("-"*60)
+    logger.info("\nTOP 5 PERIPHERAL STOCKS (Coreness Ascending):")
+    logger.debug(results.head(5).to_string(index=False))
+    logger.info("\nTOP 5 CORE STOCKS (Coreness Descending):")
+    logger.debug(results.tail(5).to_string(index=False))
     
     # Optional visualization
     if visualize_filename:
-        print(f"\nGenerating visualization...")
+        logger.info(f"\nGenerating visualization...")
         plot_network(A, ticker_names, results, visualize_filename)
     
-    print("\n" + "="*60 + "\n")
+    logger.info("\n" + "="*60 + "\n")
     return results
 
 
@@ -376,13 +386,13 @@ def main() -> None:
     """
     # Load tickers from file
     if not os.path.exists('tickers.txt'):
-        print("Error: tickers.txt not found")
+        logger.error("Error: tickers.txt not found")
         sys.exit(1)
     
     with open('tickers.txt', 'r') as f:
         ticker_list = [line.strip() for line in f if line.strip()]
     
-    print(f"Loaded {len(ticker_list)} tickers from tickers.txt")
+    logger.info(f"Loaded {len(ticker_list)} tickers from tickers.txt")
     
     # Run analysis with visualization
     results = analyze_core_periphery(
