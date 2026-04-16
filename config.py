@@ -39,6 +39,7 @@ def _load_sp500_constituents_from_file(file_path_str: str) -> tuple:
     """
     df = pd.read_csv(file_path_str)
     tickers = df["Ticker"].tolist()
+    tickers = sorted(set(tickers))
     return tuple(tickers)
 
 

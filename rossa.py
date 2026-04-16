@@ -12,6 +12,8 @@ import requests
 import yfinance as yf
 from matplotlib.lines import Line2D
 
+
+from config import DataConfig
 from data import fetch_and_cache_stock_data
 
 # LOGGING CONFIGURATION
@@ -51,9 +53,9 @@ def prepare_price_data(
     """
     # Filter by date range
     if start_date:
-        price_data = price_data[price_data.index >= start_date]
+        price_data = price_data[price_data.index >= pd.Timestamp(start_date)]
     if end_date:
-        price_data = price_data[price_data.index <= end_date]
+        price_data = price_data[price_data.index <= pd.Timestamp(end_date)]
 
     initial_tickers = price_data.shape[1]
 
@@ -117,68 +119,132 @@ def build_adjacency_matrix(log_returns: pd.DataFrame) -> Tuple[np.ndarray, pd.In
     return A, tickers
 
 
+# def rossa_core_periphery(A: np.ndarray, tickers: pd.Index) -> pd.DataFrame:
+#     """
+#     Implements core-periphery profile algorithm by Rossa et al.
+
+#     Builds a core set S by iteratively adding vertices that maximize
+#     internal connectivity (phi score). Returns tickers ranked by coreness.
+
+#     Args:
+#         A: Adjacency matrix
+#         tickers: Stock ticker names
+
+#     Returns:
+#         DataFrame with columns ['Stock', 'Coreness'] sorted by coreness
+#     """
+#     N = A.shape[0]
+#     degrees = A.sum(axis=1)  # Weighted degree
+
+#     # Start with peripheral vertex (minimum degree)
+#     first_vertex = np.argmin(degrees)
+#     S = [first_vertex]
+#     unvisited = set(range(N))
+#     unvisited.remove(first_vertex)
+
+#     phi_list = [0.0]
+#     order = [first_vertex]
+
+#     current_internal_sum = 0.0
+#     current_degree_sum = degrees[first_vertex]
+
+#     while unvisited:
+#         min_phi = float("inf")
+#         best_v = None
+#         best_internal_sum = 0.0
+
+#         for j in unvisited:
+#             edges_to_S = 2 * A[j, S].sum()
+#             test_internal = current_internal_sum + edges_to_S
+#             test_degree = current_degree_sum + degrees[j]
+
+#             # Phi score: internal density of core set
+#             phi_S = test_internal / test_degree if test_degree > 0 else float("inf")
+
+#             if phi_S < min_phi:
+#                 min_phi = phi_S
+#                 best_v = j
+#                 best_internal_sum = test_internal
+
+#         # Failsafe for disconnected graphs
+#         if best_v is None:
+#             best_v = next(iter(unvisited))
+#             min_phi = 1.0
+
+#         S.append(best_v)
+#         unvisited.remove(best_v)
+#         order.append(best_v)
+#         phi_list.append(min_phi)
+
+#         current_internal_sum = best_internal_sum
+#         current_degree_sum += degrees[best_v]
+
+#     return pd.DataFrame({"Stock": [tickers[i] for i in order], "Coreness": phi_list})
+
 def rossa_core_periphery(A: np.ndarray, tickers: pd.Index) -> pd.DataFrame:
     """
-    Implements core-periphery profile algorithm by Rossa et al.
-
-    Builds a core set S by iteratively adding vertices that maximize
-    internal connectivity (phi score). Returns tickers ranked by coreness.
-
-    Args:
-        A: Adjacency matrix
-        tickers: Stock ticker names
-
-    Returns:
-        DataFrame with columns ['Stock', 'Coreness'] sorted by coreness
+    Optimized implementation of the core-periphery profile algorithm.
+    Reduces time complexity from O(N^3) to O(N^2) via state maintenance and vectorization.
     """
     N = A.shape[0]
     degrees = A.sum(axis=1)  # Weighted degree
 
     # Start with peripheral vertex (minimum degree)
     first_vertex = np.argmin(degrees)
-    S = [first_vertex]
-    unvisited = set(range(N))
-    unvisited.remove(first_vertex)
-
-    phi_list = [0.0]
-    order = [first_vertex]
+    
+    # Pre-allocate output arrays for massive speedup
+    order = np.empty(N, dtype=int)
+    phi_list = np.empty(N, dtype=float)
+    
+    order[0] = first_vertex
+    phi_list[0] = 0.0
 
     current_internal_sum = 0.0
     current_degree_sum = degrees[first_vertex]
 
-    while unvisited:
-        min_phi = float("inf")
-        best_v = None
-        best_internal_sum = 0.0
+    # STATE MAINTENANCE: Track edges from ALL nodes to the set S
+    # This avoids recalculating A[j, S].sum() in a loop
+    edges_to_S = 2 * A[:, first_vertex]
+    
+    # Boolean mask for O(1) tracking of unvisited nodes
+    unvisited = np.ones(N, dtype=bool)
+    unvisited[first_vertex] = False
 
-        for j in unvisited:
-            edges_to_S = 2 * A[j, S].sum()
-            test_internal = current_internal_sum + edges_to_S
-            test_degree = current_degree_sum + degrees[j]
+    for i in range(1, N):
+        # Vectorized calculation for all nodes simultaneously
+        test_internal = current_internal_sum + edges_to_S
+        test_degree = current_degree_sum + degrees
 
-            # Phi score: internal density of core set
-            phi_S = test_internal / test_degree if test_degree > 0 else float("inf")
+        # Safely calculate phi scores for all nodes at once
+        with np.errstate(divide='ignore', invalid='ignore'):
+            phi_scores = np.where(test_degree > 0, test_internal / test_degree, np.inf)
+            
+        # Mask out already visited nodes by setting their score to infinity
+        phi_scores[~unvisited] = np.inf
 
-            if phi_S < min_phi:
-                min_phi = phi_S
-                best_v = j
-                best_internal_sum = test_internal
+        # Find the best vertex in one shot
+        best_v = np.argmin(phi_scores)
+        min_phi = phi_scores[best_v]
 
-        # Failsafe for disconnected graphs
-        if best_v is None:
-            best_v = next(iter(unvisited))
+        # Original failsafe for disconnected graphs
+        if np.isinf(min_phi):
+            best_v = np.nonzero(unvisited)[0][0]
             min_phi = 1.0
 
-        S.append(best_v)
-        unvisited.remove(best_v)
-        order.append(best_v)
-        phi_list.append(min_phi)
-
-        current_internal_sum = best_internal_sum
+        # Update order and tracking variables
+        order[i] = best_v
+        phi_list[i] = min_phi
+        current_internal_sum = test_internal[best_v]
         current_degree_sum += degrees[best_v]
 
-    return pd.DataFrame({"Stock": [tickers[i] for i in order], "Coreness": phi_list})
+        # CRITICAL UPDATE: Add the new node's edges to our cache in O(N) time
+        edges_to_S += 2 * A[:, best_v]
+        unvisited[best_v] = False
 
+    return pd.DataFrame({
+        "Stock": tickers[order], 
+        "Coreness": phi_list
+    })
 
 def plot_network(
     A: np.ndarray,
@@ -188,10 +254,9 @@ def plot_network(
     corr_threshold: float = 0.3,
 ) -> None:
     """
-    Visualizes stock correlation network with core-periphery structure.
+    Visualizes stock correlation network using a force-directed structure.
 
-    - Core stocks positioned at center
-    - Peripheral stocks positioned outside
+    - Highly correlated stocks form organic clusters
     - Red edges: positive correlations
     - Blue edges: negative correlations
     - Thickness: correlation strength
@@ -219,21 +284,36 @@ def plot_network(
             if abs(correlation) > corr_threshold:
                 G.add_edge(ticker_names[i], ticker_names[j], weight=correlation)
 
-    # Position nodes: map coreness to radius (core at center, periphery outside)
+    # ====================================================================
+    # FORCE-DIRECTED (SPRING) LAYOUT
+    # ====================================================================
+    # The physics engine works best when edges act as positive "springs".
+    # We want positively correlated stocks to attract each other tightly.
+    layout_weights = {}
+    for u, v, data in G.edges(data=True):
+        # Use max(0.01, weight) so positive correlations pull nodes together,
+        # but negative correlations don't break the physics calculations.
+        layout_weights[(u, v)] = max(0.01, data['weight'])
+        
+    nx.set_edge_attributes(G, layout_weights, 'layout_weight')
+
+    # Generate the organic layout.
+    # k: Cranks up the repulsion force to push nodes apart
+    # scale: Spreads the entire graph over a larger coordinate space
+    pos = nx.spring_layout(
+        G, 
+        weight='layout_weight', 
+        k=7.8,               # Increased from 0.15 to force separation
+        scale=1.0,           # Stretches the bounding box
+        iterations=500,      # Gives the engine more time to settle
+        seed=42,
+    )
+
+    # ====================================================================
+
     coreness_values = results["Coreness"].values
     min_core = coreness_values.min()
     max_core = coreness_values.max()
-
-    pos = {}
-    n_stocks = len(ticker_names)
-    for idx, (stock, coreness) in enumerate(coreness_dict.items()):
-        # Invert: high coreness -> small radius (center)
-        normalized = (coreness - min_core) / (max_core - min_core + 1e-10)
-        radius = 1.0 + 3.0 * (1.0 - normalized)
-        angle = 2 * np.pi * idx / n_stocks
-        x = radius * np.cos(angle)
-        y = radius * np.sin(angle)
-        pos[stock] = (x, y)
 
     # Create figure
     fig, ax = plt.subplots(figsize=(16, 16))
@@ -271,7 +351,7 @@ def plot_network(
     # Draw nodes colored by coreness
     node_colors = [coreness_dict[node] for node in G.nodes()]
     node_sizes = [
-        500 + 1500 * (coreness_dict[node] - min_core) / (max_core - min_core + 1e-10)
+        200 + 600 * (max_core - (coreness_dict[node] - min_core)) / (max_core - min_core + 1e-10)
         for node in G.nodes()
     ]
 
@@ -294,7 +374,7 @@ def plot_network(
         ax.text(x, y, node, ha="center", va="center", fontsize=9, fontweight="bold")
 
     # Add colorbar
-    cbar = plt.colorbar(nodes, ax=ax)
+    cbar = plt.colorbar(nodes, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("Coreness Score", fontsize=12)
 
     # Add legend
@@ -307,10 +387,11 @@ def plot_network(
     ax.legend(handles=legend_elements, loc="upper left", fontsize=11, framealpha=0.95)
 
     ax.set_title(
-        "Stock Correlation Network\nRed: Positive | Blue: Negative | Core in Center, Periphery Outside",
+        "Stock Correlation Network\nForce-Directed Clustering",
         fontsize=16,
         fontweight="bold",
     )
+
     ax.axis("off")
     plt.tight_layout()
     plt.savefig(filename, dpi=150, bbox_inches="tight")
@@ -323,7 +404,7 @@ def analyze_core_periphery(
     price_history_start_date: Optional[str] = None,
     price_history_end_date: Optional[str] = None,
     visualize_filename: Optional[str] = None,
-    cache_file: str = "stock_price_history.csv",
+    corr_threshold: float = 0.55,
 ) -> pd.DataFrame:
     """
     Main analysis function: identifies core-periphery structure in stock correlations.
@@ -341,6 +422,7 @@ def analyze_core_periphery(
         price_history_end_date: End date (YYYY-MM-DD) or None for latest
         visualize_filename: PNG filename for visualization or None to skip
         cache_file: CSV file for caching price data
+        corr_threshold: Minimum correlation magnitude to show edge (default 0.55). Higher values reduce clutter and prevent singularity.
 
     Returns:
         DataFrame with columns ['Stock', 'Coreness'] sorted by coreness score.
@@ -380,7 +462,7 @@ def analyze_core_periphery(
     # Optional visualization
     if visualize_filename:
         logger.info(f"\nGenerating visualization...")
-        plot_network(A, ticker_names, results, visualize_filename)
+        plot_network(A, ticker_names, results, visualize_filename, corr_threshold=corr_threshold)
 
     logger.info("\n" + "=" * 60 + "\n")
     return results
@@ -391,22 +473,23 @@ def main() -> None:
     Main entry point. Reads tickers from file and runs analysis.
     """
     # Load tickers from file
-    if not os.path.exists("tickers.txt"):
-        logger.error("Error: tickers.txt not found")
+    if not os.path.exists(DataConfig.TICKER_FILE    ):
+        logger.error(f"Error: {DataConfig.TICKER_FILE} not found")
         sys.exit(1)
 
-    with open("tickers.txt", "r") as f:
+    with open(DataConfig.TICKER_FILE, "r") as f:
         ticker_list = [line.strip() for line in f if line.strip()]
 
-    logger.info(f"Loaded {len(ticker_list)} tickers from tickers.txt")
+    logger.info(f"Loaded {len(ticker_list)} tickers from {DataConfig.TICKER_FILE}")
 
-    # Run analysis with visualization
+    # Run analysis with visualization (0.55 threshold avoids the "gravity well" singularity)
     results = analyze_core_periphery(
         ticker_list=ticker_list,
         price_history_start_date="2018-01-01",
         price_history_end_date=None,
-        visualize_filename="stock_network.png",
-        cache_file="stock_price_history.csv",
+        visualize_filename=f"{DataConfig.OUTPUT_DIR}/core_periphery_network.png",
+        cache_file=DataConfig.CACHE_FILE,
+        corr_threshold=0.5,
     )
 
 

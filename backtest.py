@@ -45,6 +45,7 @@ class BacktestConfig:
     factor_lookback_days: Optional[int] = None
     factor_data_file: str = "factor_returns.xlsx"
     summary_file: Optional[str] = None
+    parallel: bool = False
 
 
 @dataclass
@@ -322,6 +323,57 @@ def generate_rebalance_dates(
     return list(dates)
 
 
+def _compute_allocation_for_rebalance_date(
+    args: Tuple,
+) -> Tuple[pd.Timestamp, pd.DataFrame]:
+    """
+    Worker function for parallel allocation computation.
+
+    Executed by multiprocessing pool to compute allocations for a single rebalance date.
+
+    Args:
+        args: Tuple of (rebalance_date, ticker_list, lookback_days)
+
+    Returns:
+        Tuple of (rebalance_date, allocations_df)
+    """
+    rebalance_date, ticker_list, lookback_days = args
+
+    # Get tickers for this rebalance date (dynamic or static)
+    if callable(ticker_list):
+        current_tickers = list(ticker_list(rebalance_date.strftime("%Y-%m-%d")))
+    else:
+        current_tickers = ticker_list
+
+    # Calculate lookback window
+    lookback_start = rebalance_date - timedelta(days=lookback_days)
+    # CRITICAL: Shift end date back 1 day to avoid lookahead bias
+    analysis_end_date = rebalance_date - timedelta(days=1)
+
+    logger.info(
+        f"\nRebalance on {rebalance_date.date()}: lookback [{lookback_start.date()} to {analysis_end_date.date()}]"
+    )
+
+    # Run Rossa analysis for this period
+    results = rossa.analyze_core_periphery(
+        ticker_list=current_tickers,
+        price_history_start_date=lookback_start.strftime("%Y-%m-%d"),
+        price_history_end_date=analysis_end_date.strftime("%Y-%m-%d"),
+        visualize_filename=None,  # Skip visualization for speed
+    )
+
+    # Get allocations based on coreness
+    allocations = allocate_by_coreness(results)
+
+    # Add rebalance metadata
+    allocations["RebalanceDate"] = rebalance_date
+    allocations["Coreness_Rank"] = range(1, len(allocations) + 1)  # 1 = most peripheral
+
+    logger.info(f"  → {len(allocations)} stocks allocated")
+
+    return rebalance_date, allocations
+
+
 def allocate_by_coreness(results_df: pd.DataFrame) -> pd.DataFrame:
     """
     Maps coreness scores to portfolio allocations.
@@ -345,7 +397,7 @@ def allocate_by_coreness(results_df: pd.DataFrame) -> pd.DataFrame:
     """
 
     # Use 20th percentile as threshold: stocks in lowest 20% are PERIPHERAL
-    quantile_prop = 0.2
+    quantile_prop = 0.05
     coreness_threshold = results_df["Coreness"].quantile(quantile_prop)
 
     # Count how many core and peripheral stocks
@@ -387,6 +439,7 @@ def get_rebalance_allocations(
     ticker_list: Union[List[str], Callable[[str], List[str]]],
     rebalance_dates: List[pd.Timestamp],
     lookback_days: int,
+    parallel: bool = False,
 ) -> Dict[pd.Timestamp, pd.DataFrame]:
     """
     Compute allocations for each rebalance date using Rossa algorithm.
@@ -395,50 +448,23 @@ def get_rebalance_allocations(
         ticker_list: List of stock tickers OR callable that takes date string and returns ticker list
         rebalance_dates: List of rebalance dates
         lookback_days: Number of days of history to use for Rossa
+        parallel: If True, uses multiprocessing pool for parallel execution. Default False (sequential).
 
     Returns:
         Dictionary mapping rebalance_date -> allocation DataFrame
     """
-    rebalance_allocations = {}
+    args_list = [(date, ticker_list, lookback_days) for date in rebalance_dates]
 
-    for rebalance_date in rebalance_dates:
-        # Get tickers for this rebalance date (dynamic or static)
-        if callable(ticker_list):
-            current_tickers = list(ticker_list(rebalance_date.strftime("%Y-%m-%d")))
-        else:
-            current_tickers = ticker_list
+    if parallel and len(rebalance_dates) > 1:
+        # Use multiprocessing pool for parallel execution
+        logger.info(f"Using parallel execution with multiprocessing pool...")
+        with Pool() as pool:
+            results = pool.map(_compute_allocation_for_rebalance_date, args_list)
+    else:
+        # Sequential execution - reuse worker function logic
+        results = [_compute_allocation_for_rebalance_date(args) for args in args_list]
 
-        # Calculate lookback window
-        lookback_start = rebalance_date - timedelta(days=lookback_days)
-        # CRITICAL: Shift end date back 1 day to avoid lookahead bias
-        # (don't use today's data to make today's trades)
-        analysis_end_date = rebalance_date - timedelta(days=1)
-
-        logger.info(
-            f"\nRebalance on {rebalance_date.date()}: lookback [{lookback_start.date()} to {analysis_end_date.date()}]"
-        )
-
-        # Run Rossa analysis for this period
-        results = rossa.analyze_core_periphery(
-            ticker_list=current_tickers,
-            price_history_start_date=lookback_start.strftime("%Y-%m-%d"),
-            price_history_end_date=analysis_end_date.strftime("%Y-%m-%d"),
-            visualize_filename=None,  # Skip visualization for speed
-        )
-
-        # Get allocations based on coreness
-        allocations = allocate_by_coreness(results)
-
-        # Add rebalance metadata
-        allocations["RebalanceDate"] = rebalance_date
-        allocations["Coreness_Rank"] = range(
-            1, len(allocations) + 1
-        )  # 1 = most peripheral
-
-        rebalance_allocations[rebalance_date] = allocations
-
-        logger.info(f"  → {len(allocations)} stocks allocated")
-
+    rebalance_allocations = dict(results)
     return rebalance_allocations
 
 
@@ -476,127 +502,141 @@ def calculate_portfolio_daily_values(
 ) -> pd.DataFrame:
     """
     Calculate portfolio holdings and values with proper position tracking.
-
-    CRITICAL FIXES:
-    1. Track actual number of shares (not just target weights) to avoid daily rebalancing illusion
-    2. Let position weights DRIFT between rebalance dates (only rebalance on scheduled dates)
-    3. Use only ffill() for prices to avoid lookahead bias from bfill()
-    4. Track cash balance to handle uninvested capital from failed rebalances
-
-    Args:
-        prices: DataFrame with stock prices (index: date, columns: tickers)
-        rebalance_schedule: Dictionary mapping rebalance_date -> allocation_df
-        start_date: Backtest start (YYYY-MM-DD)
-        end_date: Backtest end (YYYY-MM-DD)
-        initial_capital: Starting portfolio value (default $100k)
-
-    Returns:
-        DataFrame with columns:
-        [Date, Ticker, Price, Position_Value, Portfolio_Total_Value]
+    Optimized via matrix vectorization to calculate periods between rebalances
+    simultaneously, bypassing slow day-by-day iteration.
     """
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
 
     # Fix lookahead bias: Only use ffill(), never bfill()
-    # This prevents projecting prices backward in time for stocks that join later
     prices_filtered = (
         prices[(prices.index >= start) & (prices.index <= end)].ffill().copy()
     )
 
-    daily_data = []
-    current_portfolio_value = initial_capital
-    current_shares = {}  # Ticker -> number of shares held
-    current_cash = initial_capital  # Cash balance (uninvested capital)
-    last_rebalance_date = None
+    # Extract sorted rebalance keys
+    reb_keys = pd.Series(sorted(list(rebalance_schedule.keys())))
+    reb_keys = reb_keys[reb_keys <= end]
 
-    for date in prices_filtered.index:
-        # Find the most recent rebalance date on or before today
-        rebalance_dates_on_or_before = [
-            d for d in rebalance_schedule.keys() if d <= date
-        ]
-        current_rebalance_date = (
-            max(rebalance_dates_on_or_before) if rebalance_dates_on_or_before else None
+    if reb_keys.empty:
+        return pd.DataFrame(
+            columns=[
+                "Date",
+                "Ticker",
+                "Price",
+                "Position_Value",
+                "Portfolio_Total_Value",
+            ]
         )
 
-        # If we've hit a NEW rebalance date, execute the rebalance
-        if (
-            current_rebalance_date is not None
-            and current_rebalance_date != last_rebalance_date
-        ):
-            allocation_df = rebalance_schedule[current_rebalance_date].copy()
-            current_shares = {}
-            invested_capital = (
-                0.0  # Track exactly how much we successfully invested/shorted
-            )
+    # Pre-process allocations into a dictionary of Series for O(1) lookups
+    allocations = {
+        k: v.set_index("Stock")["Allocation"] for k, v in rebalance_schedule.items()
+    }
 
-            # Convert target allocations to shares at today's prices
-            for _, row in allocation_df.iterrows():
-                ticker = row["Stock"]
-                allocation_weight = row["Allocation"]
+    # Map each date in prices_filtered to its currently active rebalance date
+    idx = np.searchsorted(reb_keys, prices_filtered.index, side="right") - 1
+    valid_mask = idx >= 0
 
-                if ticker not in prices_filtered.columns:
-                    continue
+    # Drop dates before the first active rebalance date
+    if not valid_mask.any():
+        return pd.DataFrame(
+            columns=[
+                "Date",
+                "Ticker",
+                "Price",
+                "Position_Value",
+                "Portfolio_Total_Value",
+            ]
+        )
 
-                target_price = prices_filtered.loc[date, ticker]
-                if pd.isna(target_price) or target_price == 0:
-                    # Failed to get price: cannot invest in this position
-                    current_shares[ticker] = 0
-                else:
-                    # Calculate shares needed to achieve target allocation
-                    target_dollars = allocation_weight * current_portfolio_value
-                    current_shares[ticker] = target_dollars / target_price
-                    invested_capital += (
-                        target_dollars  # Track total successfully deployed
-                    )
+    prices_filtered = prices_filtered[valid_mask]
+    active_reb_keys = reb_keys.iloc[idx[valid_mask]].values
 
-            # Any capital not successfully deployed goes to cash (prevents "cash leakage")
-            # Ideally invested_capital == current_portfolio_value, so cash_balance = 0.
-            # But if some stocks have bad data, cash_balance absorbs the undeployed capital.
-            current_cash = current_portfolio_value - invested_capital
-            last_rebalance_date = current_rebalance_date
+    # Find the indices where the active rebalance key changes (chunk boundaries)
+    chunk_start_indices = np.where(active_reb_keys[:-1] != active_reb_keys[1:])[0] + 1
+    chunk_start_indices = np.insert(chunk_start_indices, 0, 0)
+    chunk_end_indices = np.append(chunk_start_indices[1:], len(prices_filtered))
 
-        # Skip if no active positions yet
-        if not current_shares:
+    portfolio_value = initial_capital
+    all_chunks = []
+
+    # Loop through REBALANCE PERIODS instead of individual days
+    for start_idx, end_idx in zip(chunk_start_indices, chunk_end_indices):
+        reb_key = active_reb_keys[start_idx]
+
+        # Get the slice of price data for this entire rebalance period
+        chunk_prices = prices_filtered.iloc[start_idx:end_idx]
+        rebalance_prices = chunk_prices.iloc[0]
+
+        alloc_series = allocations[reb_key]
+        alloc_series = alloc_series[alloc_series.index.isin(rebalance_prices.index)]
+
+        target_dollars = alloc_series * portfolio_value
+        prices_at_reb = rebalance_prices[alloc_series.index]
+
+        # Filter valid prices (not NaN, not 0)
+        valid_price_mask = prices_at_reb.notna() & (prices_at_reb != 0)
+        valid_tickers = alloc_series.index[valid_price_mask]
+
+        if len(valid_tickers) == 0:
             continue
 
-        # Calculate portfolio value: start with cash, then add all position values
-        portfolio_value = current_cash
-        day_records = []
+        # Calculate shares for the entire period
+        shares = target_dollars[valid_tickers] / prices_at_reb[valid_tickers]
+        shares = shares[shares != 0]
+        valid_tickers = shares.index
 
-        for ticker, num_shares in current_shares.items():
-            if num_shares == 0:
-                continue
+        if len(valid_tickers) == 0:
+            continue
 
-            if ticker not in prices_filtered.columns:
-                continue
+        invested_capital = (shares * prices_at_reb[valid_tickers]).sum()
+        cash = portfolio_value - invested_capital
 
-            current_price = prices_filtered.loc[date, ticker]
+        # FAST VECTORIZED MATH: Calculate all daily values for this chunk at once
+        chunk_positions = chunk_prices[valid_tickers].mul(shares, axis=1)
+        chunk_port_value = chunk_positions.sum(axis=1) + cash
 
-            if pd.isna(current_price):
-                continue
+        # Flatten (melt) the dense chunk into the required long format output
+        melted_pos = chunk_positions.reset_index().melt(
+            id_vars="index", var_name="Ticker", value_name="Position_Value"
+        )
+        melted_prices = (
+            chunk_prices[valid_tickers]
+            .reset_index()
+            .melt(id_vars="index", var_name="Ticker", value_name="Price")
+        )
 
-            position_value = num_shares * current_price
-            portfolio_value += position_value
+        melted_pos.rename(columns={"index": "Date"}, inplace=True)
+        melted_pos["Price"] = melted_prices["Price"]
+        melted_pos["Portfolio_Total_Value"] = melted_pos["Date"].map(chunk_port_value)
 
-            day_records.append(
-                {
-                    "Date": date,
-                    "Ticker": ticker,
-                    "Price": current_price,
-                    "Position_Value": position_value,
-                    "Portfolio_Total_Value": portfolio_value,  # Will be updated below
-                }
-            )
+        # Drop rows where price is NaN to match your original fail-safe logic
+        melted_pos = melted_pos.dropna(subset=["Price"])
 
-        # Update all records with final portfolio value (cash + all positions)
-        for record in day_records:
-            record["Portfolio_Total_Value"] = portfolio_value
-            daily_data.append(record)
+        all_chunks.append(melted_pos)
 
-        # Update portfolio value for next day
-        current_portfolio_value = portfolio_value
+        # The ending portfolio value of this chunk becomes the starting capital of the next
+        portfolio_value = chunk_port_value.iloc[-1]
 
-    return pd.DataFrame(daily_data)
+    if not all_chunks:
+        return pd.DataFrame(
+            columns=[
+                "Date",
+                "Ticker",
+                "Price",
+                "Position_Value",
+                "Portfolio_Total_Value",
+            ]
+        )
+
+    # Combine all chunks and sort chronologically
+    final_df = pd.concat(all_chunks, ignore_index=True)
+    final_df = final_df[
+        ["Date", "Ticker", "Price", "Position_Value", "Portfolio_Total_Value"]
+    ]
+    final_df = final_df.sort_values(["Date", "Ticker"]).reset_index(drop=True)
+
+    return final_df
 
 
 def calculate_portfolio_metrics(
@@ -795,28 +835,28 @@ def export_to_excel(
         # Sheet 1: Daily Holdings (pivoted by ticker)
         # Pivot Position_Value so each ticker is a column, dates are rows
         daily_export = daily_holdings.copy()
-        daily_export["Date"] = pd.to_datetime(daily_export["Date"]).dt.strftime("%Y-%m-%d")
-        
+        daily_export["Date"] = pd.to_datetime(daily_export["Date"]).dt.strftime(
+            "%Y-%m-%d"
+        )
+
         # Pivot position values by ticker
         position_pivot = daily_export.pivot_table(
-            index="Date",
-            columns="Ticker",
-            values="Position_Value",
-            aggfunc="first"
+            index="Date", columns="Ticker", values="Position_Value", aggfunc="first"
         )
         position_pivot.to_excel(writer, sheet_name="Position Values ($)")
-        
+
         # Pivot prices by ticker (optional, for reference)
         price_pivot = daily_export.pivot_table(
-            index="Date",
-            columns="Ticker",
-            values="Price",
-            aggfunc="first"
+            index="Date", columns="Ticker", values="Price", aggfunc="first"
         )
         price_pivot.to_excel(writer, sheet_name="Prices ($)")
-        
+
         # Add portfolio total value (same for all tickers on each date)
-        portfolio_total = daily_export[["Date", "Portfolio_Total_Value"]].drop_duplicates(subset=["Date"]).set_index("Date")
+        portfolio_total = (
+            daily_export[["Date", "Portfolio_Total_Value"]]
+            .drop_duplicates(subset=["Date"])
+            .set_index("Date")
+        )
         portfolio_total.to_excel(writer, sheet_name="Portfolio Total")
 
         # Sheet 2: Portfolio Metrics (separate sheet for each metric)
@@ -826,7 +866,7 @@ def export_to_excel(
         portfolio_export["Cumulative_Return"] = portfolio_export[
             "Cumulative_Return"
         ].fillna(0)
-        
+
         # Create separate sheets for each metric
         metrics_to_export = ["Daily_Return", "Cumulative_Return"]
         for metric in metrics_to_export:
@@ -1437,11 +1477,13 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
     )
     logger.info(f"Lookback period: {config.lookback_days} days")
     logger.info(f"Rebalance interval: {config.rebalance_interval_days} days")
-    
+
     # Determine if using dynamic or static ticker list
     is_dynamic = callable(config.ticker_list)
     if is_dynamic:
-        logger.info("Using dynamic S&P 500 constituent selection (avoiding survivorship bias)")
+        logger.info(
+            "Using dynamic S&P 500 constituent selection (avoiding survivorship bias)"
+        )
     else:
         logger.info(f"Using static ticker list: {len(config.ticker_list)} tickers")
 
@@ -1462,13 +1504,16 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
             tickers = config.ticker_list(rebalance_date.strftime("%Y-%m-%d"))
             all_tickers_set.update(tickers)
         tickers_to_fetch = list(all_tickers_set)
-        logger.info(f"Dynamic mode will use {len(all_tickers_set)} unique tickers across rebalance dates")
+        logger.info(
+            f"Dynamic mode will use {len(all_tickers_set)} unique tickers across rebalance dates"
+        )
     else:
         tickers_to_fetch = list(config.ticker_list)
-    
+
     if config.benchmark_tickers:
         tickers_to_fetch.extend(config.benchmark_tickers)
 
+    # print num dups in tickers_to_fetch (should be zero if using set logic correctly)
     price_data = rossa.fetch_and_cache_stock_data(tuple(tickers_to_fetch))
 
     # Verify data covers the required backtest period
@@ -1482,7 +1527,10 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
     # Step 3: Compute allocations for each rebalance
     logger.info("[3/6] Computing allocations for each rebalance...")
     rebalance_schedule = get_rebalance_allocations(
-        config.ticker_list, rebalance_dates, config.lookback_days
+        config.ticker_list,
+        rebalance_dates,
+        config.lookback_days,
+        parallel=config.parallel,
     )
 
     # Step 4: Calculate daily portfolio values
@@ -1762,8 +1810,8 @@ def main() -> None:
 
     # =================== PARAMS ==================
 
-    lookback_days = 365
-    rebalance_interval_days = 30
+    lookback_days = 252
+    rebalance_interval_days = 21
     factor_lookback_days = 365 * 3
     benchmark_tickers = ["SPY", "QQQ"]
 
@@ -1772,80 +1820,84 @@ def main() -> None:
     # =================== SETUP ==================
 
     # prefetch
-    logger.info("Prefetching price data for all tickers...")
-    _ = rossa.fetch_and_cache_stock_data(tuple(ticker_list + benchmark_tickers))
+    # logger.info("Prefetching price data for all tickers...")
+    # _ = rossa.fetch_and_cache_stock_data(tuple(ticker_list + benchmark_tickers))
 
     # =================== SETUP ==================
 
-    # Run backtest with default parameters
-    overall_start_date = "2008-04-13"
-    overall_end_date = "2026-04-13"
-    eval_lookback = pd.DateOffset(years=1)
-    eval_interval = pd.DateOffset(months=1)
-    last_eval_end_date = pd.to_datetime(overall_end_date)
-    last_eval_start_date = last_eval_end_date - eval_lookback + pd.DateOffset(days=1)
-    eval_date_pairs = [(last_eval_start_date, last_eval_end_date)]
-    while eval_date_pairs[-1][0] > pd.to_datetime(overall_start_date):
-        prev_start = eval_date_pairs[-1][0] - eval_interval
-        prev_end = eval_date_pairs[-1][1] - eval_interval
-        eval_date_pairs.append((prev_start, prev_end))
+    # =================== EVAL SETUP ==================
 
-    portfolio_summary_over_time = []
-    summary_stats_over_time = []
+    # # Run backtest with default parameters
+    # overall_start_date = "2008-04-13"
+    # overall_end_date = "2026-04-13"
+    # eval_lookback = pd.DateOffset(years=1)
+    # eval_interval = pd.DateOffset(months=1)
+    # last_eval_end_date = pd.to_datetime(overall_end_date)
+    # last_eval_start_date = last_eval_end_date - eval_lookback + pd.DateOffset(days=1)
+    # eval_date_pairs = [(last_eval_start_date, last_eval_end_date)]
+    # while eval_date_pairs[-1][0] > pd.to_datetime(overall_start_date):
+    #     prev_start = eval_date_pairs[-1][0] - eval_interval
+    #     prev_end = eval_date_pairs[-1][1] - eval_interval
+    #     eval_date_pairs.append((prev_start, prev_end))
 
-    # Fetch price data once at the start (shared across all backtests)
-    logger.info("Fetching price data for all backtests...")
+    # portfolio_summary_over_time = []
+    # summary_stats_over_time = []
 
-    # Prepare BacktestConfig instances for parallel execution
-    logger.info(f"Running {len(eval_date_pairs)} backtests in parallel...")
-    backtest_configs = [
-        BacktestConfig(
-            ticker_list=load_sp500_constituents,
-            start_backtest_date=sub_start.strftime("%Y-%m-%d"),
-            end_backtest_date=sub_end.strftime("%Y-%m-%d"),
-            lookback_days=lookback_days,
-            rebalance_interval_days=rebalance_interval_days,
-            output_excel=None,
-            output_plots=False,
-            benchmark_tickers=None,
-            factor_list=None,
-            factor_lookback_days=None,
-        )
-        for sub_start, sub_end in reversed(eval_date_pairs)
-    ]
+    # # Fetch price data once at the start (shared across all backtests)
+    # logger.info("Fetching price data for all backtests...")
 
-    # Run backtests in parallel
-    num_workers = max(1, min(12, multiprocessing.cpu_count() - 4))
+    # # Prepare BacktestConfig instances for parallel execution
+    # logger.info(f"Running {len(eval_date_pairs)} backtests in parallel...")
+    # backtest_configs = [
+    #     BacktestConfig(
+    #         ticker_list=load_sp500_constituents,
+    #         start_backtest_date=sub_start.strftime("%Y-%m-%d"),
+    #         end_backtest_date=sub_end.strftime("%Y-%m-%d"),
+    #         lookback_days=lookback_days,
+    #         rebalance_interval_days=rebalance_interval_days,
+    #         output_excel=None,
+    #         output_plots=False,
+    #         benchmark_tickers=None,
+    #         factor_list=None,
+    #         factor_lookback_days=None,
+    #     )
+    #     for sub_start, sub_end in reversed(eval_date_pairs)
+    # ]
 
-    # Create a Manager and shared lock for cache synchronization across pool workers
-    manager = multiprocessing.Manager()
-    shared_lock = manager.Lock()
+    # # Run backtests in parallel
+    # num_workers = max(1, min(12, multiprocessing.cpu_count() - 4))
 
-    with Pool(
-        num_workers, initializer=init_worker_lock, initargs=(shared_lock,)
-    ) as pool:
-        results = list(
-            tqdm(
-                pool.imap_unordered(_backtest_worker, backtest_configs),
-                total=len(backtest_configs),
-                desc="Running backtests",
-            )
-        )
+    # # Create a Manager and shared lock for cache synchronization across pool workers
+    # manager = multiprocessing.Manager()
+    # shared_lock = manager.Lock()
 
-    # Process results
-    results_dict = {r[0]: r[1] for r in results}
-    for sub_start, sub_end in reversed(eval_date_pairs):
-        date_key = sub_start.strftime("%Y-%m-%d")
-        if date_key in results_dict:
-            backtest_result = results_dict[date_key]
-            portfolio_summary_over_time.append(backtest_result.portfolio_summary)
-            summary_stats_over_time.append(backtest_result.summary_stats)
+    # with Pool(
+    #     num_workers, initializer=init_worker_lock, initargs=(shared_lock,)
+    # ) as pool:
+    #     results = list(
+    #         tqdm(
+    #             pool.imap_unordered(_backtest_worker, backtest_configs),
+    #             total=len(backtest_configs),
+    #             desc="Running backtests",
+    #         )
+    #     )
 
-    os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
-    plot_backtest_summary_over_time(
-        summary_stats_over_time,
-        os.path.join(str(DataConfig.OUTPUT_DIR), "summary_over_time.png"),
-    )
+    # # Process results
+    # results_dict = {r[0]: r[1] for r in results}
+    # for sub_start, sub_end in reversed(eval_date_pairs):
+    #     date_key = sub_start.strftime("%Y-%m-%d")
+    #     if date_key in results_dict:
+    #         backtest_result = results_dict[date_key]
+    #         portfolio_summary_over_time.append(backtest_result.portfolio_summary)
+    #         summary_stats_over_time.append(backtest_result.summary_stats)
+
+    # os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
+    # plot_backtest_summary_over_time(
+    #     summary_stats_over_time,
+    #     os.path.join(str(DataConfig.OUTPUT_DIR), "summary_over_time.png"),
+    # )
+
+    # =================== EVAL SETUP ==================
 
     # Create and run final full backtest with all outputs
     # Use dynamic S&P 500 constituents to avoid survivorship bias
@@ -1855,13 +1907,17 @@ def main() -> None:
         end_backtest_date="2026-04-13",
         lookback_days=lookback_days,
         rebalance_interval_days=rebalance_interval_days,
-        output_excel="backtest_results.xlsx",
-        output_plots=True,
+        # output_excel="backtest_results.xlsx",
+        output_excel=None,
+        # output_plots=True,
+        output_plots=False,
         benchmark_tickers=benchmark_tickers,
-        factor_list=None,  # Use all available factors
-        factor_lookback_days=factor_lookback_days,
+        factor_list=None,
+        # factor_lookback_days=factor_lookback_days,
+        factor_lookback_days=None,
         factor_data_file=str(DataConfig.FACTOR_FILE),
         summary_file="backtest_summary.txt",
+        parallel=True,
     )
 
     final_result = run_backtest(final_config)

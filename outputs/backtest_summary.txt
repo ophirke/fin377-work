@@ -4,22 +4,22 @@ BACKTEST SUMMARY
 
 STRATEGY PERFORMANCE METRICS
 ----------------------------------------------------------------------
-Total Return:                         1239.33%
-Annualized Return (geometric):          15.54%
-Arithmetic Average Return:              15.89%
-Volatility (annualized):                16.96%
-Volatility Drag:                         1.44%
+Total Return:                          746.56%
+Annualized Return (geometric):          12.58%
+Arithmetic Average Return:              13.71%
+Volatility (annualized):                19.28%
+Volatility Drag:                         1.86%
 
 RISK-ADJUSTED METRICS
 ----------------------------------------------------------------------
-Sharpe Ratio:                          0.7392
-Sortino Ratio:                         1.0858
-Max Drawdown:                           35.14%
+Sharpe Ratio:                          0.4971
+Sortino Ratio:                         0.7234
+Max Drawdown:                           39.15%
 
 PORTFOLIO VALUES
 ----------------------------------------------------------------------
 Initial Capital:                 $  100,000.00
-Final Portfolio Value:           $1,339,325.24
+Final Portfolio Value:           $  846,558.64
 
 ======================================================================
 BENCHMARK COMPARISON
@@ -28,21 +28,21 @@ BENCHMARK COMPARISON
 SPY
 ----------------------------------------------------------------------
 Total Return:                          620.99%
-Annualized Return (geometric):          11.62%
-Arithmetic Average Return:              12.97%
-Volatility (annualized):                19.83%
-Sharpe Ratio:                          0.4348
-Sortino Ratio:                         0.6142
+Annualized Return (geometric):          11.59%
+Arithmetic Average Return:              12.93%
+Volatility (annualized):                19.80%
+Sharpe Ratio:                          0.4336
+Sortino Ratio:                         0.6124
 Max Drawdown:                           51.48%
 
 QQQ
 ----------------------------------------------------------------------
 Total Return:                         1525.76%
-Annualized Return (geometric):          16.79%
-Arithmetic Average Return:              18.02%
-Volatility (annualized):                22.31%
-Sharpe Ratio:                          0.6181
-Sortino Ratio:                         0.8809
+Annualized Return (geometric):          16.74%
+Arithmetic Average Return:              17.96%
+Volatility (annualized):                22.28%
+Sharpe Ratio:                          0.6165
+Sortino Ratio:                         0.8787
 Max Drawdown:                           49.37%
 
 ======================================================================
