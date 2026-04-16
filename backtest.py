@@ -20,9 +20,13 @@ import pandas as pd
 from tqdm import tqdm
 
 import rossa
-from config import DataConfig, load_sp500_constituents
+from datamarshal import DataConfig, load_sp100_constituents, load_sp500_constituents, load_nasdaq100_constituents
 from data import init_worker_lock
 from factor import compute_factor_loadings, load_factor_data
+
+SHORT_AMOUNT = 0.30
+PERIPHERY_THRESHOLD_QUANTILE = 0.05
+LONG_PERIPHERY = True
 
 # ============================================================================
 # BACKTEST CONFIGURATION
@@ -397,7 +401,7 @@ def allocate_by_coreness(results_df: pd.DataFrame) -> pd.DataFrame:
     """
 
     # Use 20th percentile as threshold: stocks in lowest 20% are PERIPHERAL
-    quantile_prop = 0.05
+    quantile_prop = PERIPHERY_THRESHOLD_QUANTILE
     coreness_threshold = results_df["Coreness"].quantile(quantile_prop)
 
     # Count how many core and peripheral stocks
@@ -409,13 +413,21 @@ def allocate_by_coreness(results_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     allocations = []
+
     for _, row in results_df.iterrows():
-        if row["Coreness"] >= coreness_threshold:
-            # Core stock: divide -30% exposure equally among all core stocks
-            allocation = -0.30 / n_core if n_core > 0 else 0.0
-        else:
-            # Peripheral stock: divide 130% exposure equally among all peripheral stocks
-            allocation = 1.30 / n_peripheral if n_peripheral > 0 else 0.0
+        
+        core_alloc = -SHORT_AMOUNT
+        periphery_alloc = 1.0 - core_alloc
+        if not LONG_PERIPHERY:
+            core_alloc, periphery_alloc = periphery_alloc, core_alloc
+        core_alloc = core_alloc / n_core if n_core > 0 else 0.0
+        periphery_alloc = periphery_alloc / n_peripheral if n_peripheral > 0 else 0.0
+        allocation = core_alloc if row["Coreness"] >= coreness_threshold else periphery_alloc
+
+        # if (row["Coreness"] >= coreness_threshold):
+        #     allocation = -SHORT_AMOUNT / n_core if n_core > 0 else 0.0
+        # else:
+        #     allocation = (1.0 + SHORT_AMOUNT) / n_peripheral if n_peripheral > 0 else 0.0
 
         allocations.append(
             {
@@ -424,6 +436,11 @@ def allocate_by_coreness(results_df: pd.DataFrame) -> pd.DataFrame:
                 "Allocation": allocation,
             }
         )
+        
+    # check that total allocation sums to 1.0 (or very close due to rounding)
+    total_alloc = sum(a["Allocation"] for a in allocations)
+    if not np.isclose(total_alloc, 1.0):
+        raise ValueError(f"Total allocation sums to {total_alloc:.4f}, expected 1.0")
 
     # Sort by coreness ascending (rank 1 = lowest coreness = most peripheral)
     allocations_df = pd.DataFrame(allocations)
@@ -1599,6 +1616,15 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
             portfolio_summary, benchmark_data, output_dir=str(DataConfig.OUTPUT_DIR)
         )
 
+        # Compute and plot benchmark summary stats over time
+        if benchmark_data and rebalance_dates:
+            benchmark_stats_over_time = compute_benchmark_summary_stats_over_time(
+                benchmark_data, rebalance_dates, lookback_days=config.lookback_days
+            )
+            plot_benchmark_summary_over_time(
+                benchmark_stats_over_time, output_dir=str(DataConfig.OUTPUT_DIR)
+            )
+
     # Print summary statistics
     print_backtest_summary(summary_stats, portfolio_summary, benchmark_metrics)
 
@@ -1720,6 +1746,167 @@ def print_backtest_summary(
         logger.info("=" * 70)
 
 
+def compute_benchmark_summary_stats_over_time(
+    benchmark_data: Dict[str, pd.DataFrame],
+    rebalance_dates: List[pd.Timestamp],
+    lookback_days: int = 252,
+) -> Dict[str, List[Dict]]:
+    """
+    Compute summary statistics over time for each benchmark at each rebalance date.
+
+    For each benchmark and rebalance date, computes annualized return, volatility,
+    and Sharpe ratio using a rolling lookback window.
+
+    Args:
+        benchmark_data: Dict mapping benchmark_ticker -> daily_metrics_df
+        rebalance_dates: List of rebalance dates
+        lookback_days: Lookback window in days (default 252 = 1 year)
+
+    Returns:
+        Dict mapping benchmark_ticker -> List[Dict with Date, Annualized_Return, Volatility, Sharpe_Ratio]
+    """
+    RF_RATE = 0.03  # 3% annual risk-free rate
+
+    benchmark_stats_over_time = {}
+
+    for ticker, bench_df in benchmark_data.items():
+        stats_list = []
+
+        for rebalance_date in rebalance_dates:
+            # Get data within lookback window ending at rebalance_date
+            window_start = rebalance_date - pd.Timedelta(days=lookback_days)
+            window_data = bench_df[
+                (bench_df["Date"] >= window_start) & (bench_df["Date"] <= rebalance_date)
+            ].copy()
+
+            if len(window_data) < 2:
+                continue
+
+            # Compute daily returns
+            daily_values = window_data["Portfolio_Value"].values
+            daily_returns = np.diff(daily_values) / daily_values[:-1]
+
+            # Annualized return (geometric)
+            total_return = (daily_values[-1] - daily_values[0]) / daily_values[0]
+            days_elapsed = (window_data["Date"].iloc[-1] - window_data["Date"].iloc[0]).days
+            years_elapsed = max(days_elapsed / 365.0, 1.0 / 252.0)  # At least 1 day
+            annual_return = ((1 + total_return) ** (1 / years_elapsed)) - 1
+
+            # Annualized volatility
+            daily_volatility = np.std(daily_returns)
+            annualized_volatility = daily_volatility * np.sqrt(252)
+
+            # Sharpe ratio
+            annual_return_excess = annual_return - RF_RATE
+            sharpe_ratio = (
+                annual_return_excess / annualized_volatility
+                if annualized_volatility > 0
+                else 0.0
+            )
+
+            stats_list.append(
+                {
+                    "Date": rebalance_date,
+                    "Annualized_Return": annual_return,
+                    "Volatility": annualized_volatility,
+                    "Sharpe_Ratio": sharpe_ratio,
+                }
+            )
+
+        benchmark_stats_over_time[ticker] = stats_list
+
+    return benchmark_stats_over_time
+
+
+def plot_benchmark_summary_over_time(
+    benchmark_stats_over_time: Dict[str, List[Dict]],
+    output_dir: str = ".",
+) -> None:
+    """
+    Plot summary statistics over time for each benchmark.
+
+    Creates individual 3-subplot figures for each benchmark showing:
+    - Annualized Return Over Time
+    - Volatility Over Time
+    - Sharpe Ratio Over Time
+
+    Args:
+        benchmark_stats_over_time: Dict mapping benchmark_ticker -> List[Dict with stats]
+        output_dir: Directory to save plots
+    """
+    for ticker, stats_list in benchmark_stats_over_time.items():
+        if not stats_list or len(stats_list) < 2:
+            logger.warning(f"Not enough data points for {ticker} summary stats plot.")
+            continue
+
+        # Convert list of dicts to DataFrame
+        summary_df = pd.DataFrame(stats_list)
+        summary_df["Date"] = pd.to_datetime(summary_df["Date"])
+        summary_df = summary_df.sort_values("Date")
+
+        fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+
+        # Plot 1: Annualized Return
+        axes[0].plot(
+            summary_df["Date"],
+            summary_df["Annualized_Return"] * 100,
+            marker="o",
+            linewidth=2,
+            markersize=6,
+            color="blue",
+        )
+        axes[0].set_title(
+            f"{ticker} - Annualized Return Over Time",
+            fontsize=12,
+            fontweight="bold",
+        )
+        axes[0].set_ylabel("Return (%)")
+        axes[0].grid(True, alpha=0.3)
+
+        # Plot 2: Volatility
+        axes[1].plot(
+            summary_df["Date"],
+            summary_df["Volatility"] * 100,
+            marker="o",
+            linewidth=2,
+            markersize=6,
+            color="orange",
+        )
+        axes[1].set_title(
+            f"{ticker} - Volatility Over Time",
+            fontsize=12,
+            fontweight="bold",
+        )
+        axes[1].set_ylabel("Volatility (%)")
+        axes[1].grid(True, alpha=0.3)
+
+        # Plot 3: Sharpe Ratio
+        axes[2].plot(
+            summary_df["Date"],
+            summary_df["Sharpe_Ratio"],
+            marker="o",
+            linewidth=2,
+            markersize=6,
+            color="green",
+        )
+        axes[2].set_title(
+            f"{ticker} - Sharpe Ratio Over Time",
+            fontsize=12,
+            fontweight="bold",
+        )
+        axes[2].set_xlabel("Date")
+        axes[2].set_ylabel("Sharpe Ratio")
+        axes[2].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        output_file = os.path.join(
+            output_dir, f"benchmark_summary_over_time_{ticker}.png"
+        )
+        plt.savefig(output_file, dpi=150, bbox_inches="tight")
+        logger.info(f"Benchmark summary plot saved: {output_file}")
+        plt.close()
+
+
 def plot_backtest_summary_over_time(
     summary_stats_over_time: List[Dict], output_file: str = "summary_over_time.png"
 ) -> None:
@@ -1810,8 +1997,8 @@ def main() -> None:
 
     # =================== PARAMS ==================
 
-    lookback_days = 252
-    rebalance_interval_days = 21
+    lookback_days = 365
+    rebalance_interval_days = 30
     factor_lookback_days = 365 * 3
     benchmark_tickers = ["SPY", "QQQ"]
 
@@ -1902,19 +2089,21 @@ def main() -> None:
     # Create and run final full backtest with all outputs
     # Use dynamic S&P 500 constituents to avoid survivorship bias
     final_config = BacktestConfig(
-        ticker_list=load_sp500_constituents,
-        start_backtest_date="2008-04-13",
+        # ticker_list=load_sp100_constituents,
+        # ticker_list=load_sp500_constituents,
+        ticker_list=load_nasdaq100_constituents,
+        start_backtest_date="2015-04-13",
         end_backtest_date="2026-04-13",
         lookback_days=lookback_days,
         rebalance_interval_days=rebalance_interval_days,
         # output_excel="backtest_results.xlsx",
         output_excel=None,
-        # output_plots=True,
-        output_plots=False,
+        output_plots=True,
+        # output_plots=False,
         benchmark_tickers=benchmark_tickers,
         factor_list=None,
-        # factor_lookback_days=factor_lookback_days,
-        factor_lookback_days=None,
+        factor_lookback_days=factor_lookback_days,
+        # factor_lookback_days=None,
         factor_data_file=str(DataConfig.FACTOR_FILE),
         summary_file="backtest_summary.txt",
         parallel=True,

@@ -1,0 +1,33 @@
+
+name: Validate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: |
+          pipx install uv
+          uv sync --group dev
+          pipx install rust-just
+      - name: Run linters
+        run: just lint
+      - name: Check types
+        run: just typing
+      - name: Run pytest
+        run: just test
+      - name: Generate test coverage
+        run: just cov

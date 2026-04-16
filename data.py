@@ -17,7 +17,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-from config import DataConfig
+from datamarshal import DataConfig
 
 # LOGGING CONFIGURATION
 LOG_LEVEL = logging.INFO  # Change to logging.DEBUG for verbose output

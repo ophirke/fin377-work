@@ -11,9 +11,9 @@ import pandas as pd
 import requests
 import yfinance as yf
 from matplotlib.lines import Line2D
+from datamarshal import load_sp100_constituents, load_nasdaq100_constituents, load_sp500_constituents
 
-
-from config import DataConfig
+from datamarshal import DataConfig
 from data import fetch_and_cache_stock_data
 
 # LOGGING CONFIGURATION
@@ -481,6 +481,8 @@ def main() -> None:
         ticker_list = [line.strip() for line in f if line.strip()]
 
     logger.info(f"Loaded {len(ticker_list)} tickers from {DataConfig.TICKER_FILE}")
+    
+    ticker_list = load_nasdaq100_constituents("2018-01-01")
 
     # Run analysis with visualization (0.55 threshold avoids the "gravity well" singularity)
     results = analyze_core_periphery(
@@ -488,7 +490,6 @@ def main() -> None:
         price_history_start_date="2018-01-01",
         price_history_end_date=None,
         visualize_filename=f"{DataConfig.OUTPUT_DIR}/core_periphery_network.png",
-        cache_file=DataConfig.CACHE_FILE,
         corr_threshold=0.5,
     )
 

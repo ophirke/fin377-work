@@ -1,0 +1,68 @@
+import datetime
+
+from nasdaq_100_ticker_history import tickers_as_of
+
+from .helpers import _test_at_year_boundary, _test_one_swap
+
+num_tickers_2025 = 101
+
+
+def test_year_boundary_2024_2025() -> None:
+    assert len(tickers_as_of(2025, 1, 1)) == num_tickers_2025
+    _test_at_year_boundary(2025)
+
+
+def test_may_2025_shop_mdb_swap() -> None:
+    # On May 19, Shopify (SHOP) replaced MongoDB (MDB) in the index
+    _test_one_swap(datetime.date.fromisoformat("2025-05-19"), "MDB", "SHOP", num_tickers_2025)
+
+
+def test_jul_2025_anss_tri_swap() -> None:
+    # Jul 28 Thompson Reuters TRI replaces Ansys ANSS, which had been
+    # acquired by Synopsys on Jul 17.
+    _test_one_swap(datetime.date.fromisoformat("2025-07-28"), "ANSS", "TRI", num_tickers_2025)
+
+
+def test_oct_2025_sols_added() -> None:
+    # On Oct 30, 2025, Solstice Advanced Materials SOLS was spun off from Honeywell HON
+    # bringing the total number of tickers to 102.
+    tickers_before = tickers_as_of(2025, 10, 29)
+    tickers_after = tickers_as_of(2025, 10, 30)
+    assert len(tickers_after) == num_tickers_2025 + 1
+    assert "SOLS" not in tickers_before
+    assert "SOLS" in tickers_after
+
+
+def test_nov_2025_sols_removed() -> None:
+    # On Nov 6, 2025, SOLS was removed for not meeting weight requirements,
+    # returning the total to 101.
+    tickers_before = tickers_as_of(2025, 11, 5)
+    tickers_after = tickers_as_of(2025, 11, 6)
+    assert len(tickers_before) == num_tickers_2025 + 1
+    assert len(tickers_after) == num_tickers_2025
+    assert "SOLS" in tickers_before
+    assert "SOLS" not in tickers_after
+
+
+def test_dec_2025_annual_reconstitution() -> None:
+    # On Dec 22, 2025, annual reconstitution:
+    # Removed: BIIB, CDW, GFS, LULU, ON, TTD
+    # Added: ALNY, FER, INSM, MPWR, STX, WDC
+    tickers_before = tickers_as_of(2025, 12, 21)
+    tickers_after = tickers_as_of(2025, 12, 22)
+
+    # Total should remain 101 (6 removed, 6 added)
+    assert len(tickers_before) == num_tickers_2025
+    assert len(tickers_after) == num_tickers_2025
+
+    # Verify removals
+    removed = {"BIIB", "CDW", "GFS", "LULU", "ON", "TTD"}
+    for ticker in removed:
+        assert ticker in tickers_before
+        assert ticker not in tickers_after
+
+    # Verify additions
+    added = {"ALNY", "FER", "INSM", "MPWR", "STX", "WDC"}
+    for ticker in added:
+        assert ticker not in tickers_before
+        assert ticker in tickers_after
