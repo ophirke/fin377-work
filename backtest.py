@@ -30,8 +30,8 @@ from datamarshal import (
 )
 from factor import compute_factor_loadings, load_factor_data
 
-SHORT_AMOUNT = 0.30
-PERIPHERY_THRESHOLD_QUANTILE = 0.1
+SHORT_AMOUNT = 0.90
+PERIPHERY_THRESHOLD_QUANTILE = 0.05
 LONG_PERIPHERY = True
 WEIGHTING_METHOD = "equal"  # Options: "equal", "markowitz_min_vol"
 MAX_LONG_WEIGHT = 1.0 + SHORT_AMOUNT

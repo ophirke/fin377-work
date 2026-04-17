@@ -10,7 +10,7 @@ from backtest import (
     StepForwardBacktestRun,
     load_tickers_from_file,
 )
-from datamarshal import DataConfig, load_nasdaq100_constituents, load_sp500_constituents
+from datamarshal import DataConfig, load_nasdaq100_constituents, load_sp100_constituents, load_sp500_constituents
 
 
 RUN_SINGLE_BACKTEST = True
@@ -25,6 +25,7 @@ def create_backtests():
     benchmark_tickers = ["SPY", "IWM"]
 
     # Pick the universe you want to use.
+    # ticker_source = load_sp100_constituents
     ticker_source = load_sp500_constituents
     # ticker_source = load_nasdaq100_constituents
     # ticker_source = load_tickers_from_file(DataConfig.TICKER_FILE)
