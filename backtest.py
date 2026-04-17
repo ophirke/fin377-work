@@ -9,10 +9,10 @@ core stocks. Tracks daily portfolio values and outputs results to Excel with vis
 import logging
 import multiprocessing
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from multiprocessing import Pool
-from typing import Dict, List, Optional, Tuple, Union, Callable
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,8 +21,13 @@ from scipy.optimize import minimize
 from tqdm import tqdm
 
 import rossa
-from datamarshal import DataConfig, load_sp100_constituents, load_sp500_constituents, load_nasdaq100_constituents
-from data import init_worker_lock, clean_price_data
+from data import clean_price_data, init_worker_lock
+from datamarshal import (
+    DataConfig,
+    load_nasdaq100_constituents,
+    load_sp100_constituents,
+    load_sp500_constituents,
+)
 from factor import compute_factor_loadings, load_factor_data
 
 SHORT_AMOUNT = 0.30
@@ -34,7 +39,7 @@ MAX_SHORT_WEIGHT = SHORT_AMOUNT
 
 if not LONG_PERIPHERY:
     PERIPHERY_THRESHOLD_QUANTILE = 1 - PERIPHERY_THRESHOLD_QUANTILE
-    
+
 NUM_WORKERS = max(1, min(12, multiprocessing.cpu_count() - 4))
 
 # ============================================================================
@@ -149,6 +154,39 @@ class BacktestResult:
             )
 
         return pd.DataFrame(results)
+
+
+@dataclass
+class SingleBacktestRun:
+    """A single backtest execution plan."""
+
+    name: str
+    config: BacktestConfig
+
+
+@dataclass
+class StepForwardBacktestRun:
+    """A step-forward evaluation plan built from repeated backtests."""
+
+    name: str
+    base_config: BacktestConfig
+    overall_start_date: str
+    overall_end_date: str
+    eval_lookback: pd.DateOffset
+    eval_interval: pd.DateOffset
+    summary_plot_filename: Optional[str] = None
+    parallel: bool = True
+
+
+@dataclass
+class StepForwardBacktestResult:
+    """Results from a full step-forward evaluation."""
+
+    results_by_start_date: Dict[str, BacktestResult]
+    summary_stats_over_time: List[Dict]
+
+
+ConfiguredRun = Union[SingleBacktestRun, StepForwardBacktestRun]
 
 
 # ============================================================================
@@ -424,14 +462,15 @@ def _allocate_by_coreness_equal_legacy(results_df: pd.DataFrame) -> pd.DataFrame
     allocations = []
 
     for _, row in results_df.iterrows():
-        
         core_alloc = -SHORT_AMOUNT
         periphery_alloc = 1.0 - core_alloc
         if not LONG_PERIPHERY:
             core_alloc, periphery_alloc = periphery_alloc, core_alloc
         core_alloc = core_alloc / n_core if n_core > 0 else 0.0
         periphery_alloc = periphery_alloc / n_peripheral if n_peripheral > 0 else 0.0
-        allocation = core_alloc if row["Coreness"] >= coreness_threshold else periphery_alloc
+        allocation = (
+            core_alloc if row["Coreness"] >= coreness_threshold else periphery_alloc
+        )
 
         # if (row["Coreness"] >= coreness_threshold):
         #     allocation = -SHORT_AMOUNT / n_core if n_core > 0 else 0.0
@@ -445,7 +484,7 @@ def _allocate_by_coreness_equal_legacy(results_df: pd.DataFrame) -> pd.DataFrame
                 "Allocation": allocation,
             }
         )
-        
+
     # check that total allocation sums to 1.0 (or very close due to rounding)
     total_alloc = sum(a["Allocation"] for a in allocations)
     if not np.isclose(total_alloc, 1.0):
@@ -785,7 +824,7 @@ def calculate_portfolio_daily_values(
 
         alloc_series = allocations[reb_key]
         alloc_series = alloc_series[alloc_series.index.isin(rebalance_prices.index)]
-        
+
         target_dollars = alloc_series * portfolio_value
         prices_at_reb = rebalance_prices[alloc_series.index]
 
@@ -800,7 +839,7 @@ def calculate_portfolio_daily_values(
         shares = target_dollars[valid_tickers] / prices_at_reb[valid_tickers]
         shares = shares[shares != 0]
         # Remove duplicate index labels (keep first occurrence)
-        shares = shares[~shares.index.duplicated(keep='first')]
+        shares = shares[~shares.index.duplicated(keep="first")]
         valid_tickers = shares.index
 
         if len(valid_tickers) == 0:
@@ -1039,9 +1078,7 @@ def _write_backtest_sheets(
 
     # Pivot prices by ticker (optional, for reference)
     price_pivot = (
-        daily_export.groupby(["Date", "Ticker"], sort=False)["Price"]
-        .first()
-        .unstack()
+        daily_export.groupby(["Date", "Ticker"], sort=False)["Price"].first().unstack()
     )
     price_pivot.to_excel(writer, sheet_name="Prices ($)")
 
@@ -1962,6 +1999,119 @@ def _backtest_worker(config: BacktestConfig) -> Tuple[str, BacktestResult]:
     return (config.start_backtest_date, result)
 
 
+def load_tickers_from_file(ticker_file: Union[str, os.PathLike]) -> List[str]:
+    """Load a plain-text ticker list from disk."""
+    ticker_path = str(ticker_file)
+    if not os.path.exists(ticker_path):
+        raise FileNotFoundError(f"{ticker_path} not found")
+
+    with open(ticker_path, "r") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def generate_step_forward_date_pairs(
+    overall_start_date: str,
+    overall_end_date: str,
+    eval_lookback: pd.DateOffset,
+    eval_interval: pd.DateOffset,
+) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """Generate rolling step-forward evaluation windows."""
+    start_bound = pd.to_datetime(overall_start_date)
+    end_bound = pd.to_datetime(overall_end_date)
+
+    last_end_date = end_bound
+    last_start_date = last_end_date - eval_lookback + pd.DateOffset(days=1)
+    date_pairs = [(last_start_date, last_end_date)]
+
+    while date_pairs[-1][0] > start_bound:
+        prev_start = date_pairs[-1][0] - eval_interval
+        prev_end = date_pairs[-1][1] - eval_interval
+        date_pairs.append((prev_start, prev_end))
+
+    filtered_pairs = []
+    for start_date, end_date in reversed(date_pairs):
+        if start_date < start_bound:
+            start_date = start_bound
+        if start_date <= end_date:
+            filtered_pairs.append((start_date, end_date))
+
+    return filtered_pairs
+
+
+def build_step_forward_configs(plan: StepForwardBacktestRun) -> List[BacktestConfig]:
+    """Create child backtest configs for a step-forward evaluation plan."""
+    date_pairs = generate_step_forward_date_pairs(
+        plan.overall_start_date,
+        plan.overall_end_date,
+        plan.eval_lookback,
+        plan.eval_interval,
+    )
+
+    configs = []
+    for start_date, end_date in date_pairs:
+        configs.append(
+            replace(
+                plan.base_config,
+                start_backtest_date=start_date.strftime("%Y-%m-%d"),
+                end_backtest_date=end_date.strftime("%Y-%m-%d"),
+            )
+        )
+    return configs
+
+
+def run_step_forward_evaluation(
+    plan: StepForwardBacktestRun,
+) -> StepForwardBacktestResult:
+    """Run a rolling step-forward evaluation."""
+    backtest_configs = build_step_forward_configs(plan)
+    logger.info(
+        f"Running {len(backtest_configs)} step-forward backtests for {plan.name}"
+    )
+
+    if plan.parallel and len(backtest_configs) > 1:
+        manager = multiprocessing.Manager()
+        shared_lock = manager.Lock()
+        with Pool(
+            NUM_WORKERS, initializer=init_worker_lock, initargs=(shared_lock,)
+        ) as pool:
+            results = list(
+                tqdm(
+                    pool.imap_unordered(_backtest_worker, backtest_configs),
+                    total=len(backtest_configs),
+                    desc=f"Running {plan.name}",
+                )
+            )
+    else:
+        results = [_backtest_worker(config) for config in backtest_configs]
+
+    results_dict = {start_date: result for start_date, result in results}
+    summary_stats_over_time = []
+
+    for config in backtest_configs:
+        date_key = config.start_backtest_date
+        if date_key not in results_dict:
+            continue
+
+        result = results_dict[date_key]
+        summary_row = dict(result.summary_stats)
+        summary_row["Date"] = pd.Timestamp(config.end_backtest_date)
+        summary_row["Window_Start"] = pd.Timestamp(config.start_backtest_date)
+        summary_row["Window_End"] = pd.Timestamp(config.end_backtest_date)
+        summary_stats_over_time.append(summary_row)
+
+    if plan.summary_plot_filename and summary_stats_over_time:
+        os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
+        plot_backtest_summary_over_time(
+            summary_stats_over_time,
+            os.path.join(str(DataConfig.OUTPUT_DIR), plan.summary_plot_filename),
+        )
+
+    return StepForwardBacktestResult(
+        results_by_start_date=results_dict,
+        summary_stats_over_time=summary_stats_over_time,
+    )
+
+
 def print_backtest_summary(
     summary_stats: Dict,
     portfolio_summary: pd.DataFrame,
@@ -2034,7 +2184,8 @@ def compute_benchmark_summary_stats_over_time(
             # Get data within lookback window ending at rebalance_date
             window_start = rebalance_date - pd.Timedelta(days=lookback_days)
             window_data = bench_df[
-                (bench_df["Date"] >= window_start) & (bench_df["Date"] <= rebalance_date)
+                (bench_df["Date"] >= window_start)
+                & (bench_df["Date"] <= rebalance_date)
             ].copy()
 
             if len(window_data) < 2:
@@ -2046,7 +2197,9 @@ def compute_benchmark_summary_stats_over_time(
 
             # Annualized return (geometric)
             total_return = (daily_values[-1] - daily_values[0]) / daily_values[0]
-            days_elapsed = (window_data["Date"].iloc[-1] - window_data["Date"].iloc[0]).days
+            days_elapsed = (
+                window_data["Date"].iloc[-1] - window_data["Date"].iloc[0]
+            ).days
             years_elapsed = max(days_elapsed / 365.0, 1.0 / 252.0)  # At least 1 day
             annual_return = ((1 + total_return) ** (1 / years_elapsed)) - 1
 
@@ -2242,138 +2395,41 @@ def plot_backtest_summary_over_time(
     plt.close()
 
 
+def execute_run(
+    plan: ConfiguredRun,
+) -> Union[BacktestResult, StepForwardBacktestResult]:
+    """Execute a configured run plan."""
+    logger.info("=" * 70)
+    logger.info(f"RUN PLAN: {plan.name}")
+    logger.info("=" * 70)
+
+    if hasattr(plan, "config") and not hasattr(plan, "base_config"):
+        return run_backtest(plan.config)
+    if hasattr(plan, "base_config"):
+        return run_step_forward_evaluation(plan)
+
+    raise TypeError(f"Unsupported run plan type: {type(plan)!r}")
+
+
+def execute_runs(
+    plans: List[ConfiguredRun],
+) -> Dict[str, Union[BacktestResult, StepForwardBacktestResult]]:
+    """Execute all configured runs and return results keyed by plan name."""
+    results = {}
+    for plan in plans:
+        results[plan.name] = execute_run(plan)
+    return results
+
+
 def main() -> None:
-    # Load tickers from file
-    if not os.path.exists(str(DataConfig.TICKER_FILE)):
-        logger.error(f"{DataConfig.TICKER_FILE} not found")
+    from runconfig import create_backtests
+
+    plans = create_backtests()
+    if not plans:
+        logger.warning("No backtests configured in runconfig.create_backtests()")
         return
 
-    with open(str(DataConfig.TICKER_FILE), "r") as f:
-        ticker_list = [line.strip() for line in f if line.strip()]
-
-    logger.info(f"Loaded {len(ticker_list)} tickers from {DataConfig.TICKER_FILE}")
-
-    # =================== PARAMS ==================
-
-    lookback_days = 365
-    rebalance_interval_days = 30
-    factor_lookback_days = 365 * 3
-    benchmark_tickers = ["SPY", "IWM"]
-
-    # =================== PARAMS ==================
-
-    # =================== SETUP ==================
-
-    # prefetch
-    # logger.info("Prefetching price data for all tickers...")
-    # _ = rossa.fetch_and_cache_stock_data(tuple(ticker_list + benchmark_tickers))
-
-    # =================== SETUP ==================
-
-    # =================== EVAL SETUP ==================
-
-    # # Run backtest with default parameters
-    # overall_start_date = "2008-04-13"
-    # overall_end_date = "2026-04-13"
-    # eval_lookback = pd.DateOffset(years=1)
-    # eval_interval = pd.DateOffset(months=1)
-    # last_eval_end_date = pd.to_datetime(overall_end_date)
-    # last_eval_start_date = last_eval_end_date - eval_lookback + pd.DateOffset(days=1)
-    # eval_date_pairs = [(last_eval_start_date, last_eval_end_date)]
-    # while eval_date_pairs[-1][0] > pd.to_datetime(overall_start_date):
-    #     prev_start = eval_date_pairs[-1][0] - eval_interval
-    #     prev_end = eval_date_pairs[-1][1] - eval_interval
-    #     eval_date_pairs.append((prev_start, prev_end))
-
-    # portfolio_summary_over_time = []
-    # summary_stats_over_time = []
-
-    # # Fetch price data once at the start (shared across all backtests)
-    # logger.info("Fetching price data for all backtests...")
-
-    # # Prepare BacktestConfig instances for parallel execution
-    # logger.info(f"Running {len(eval_date_pairs)} backtests in parallel...")
-    # backtest_configs = [
-    #     BacktestConfig(
-    #         ticker_list=load_sp500_constituents,
-    #         start_backtest_date=sub_start.strftime("%Y-%m-%d"),
-    #         end_backtest_date=sub_end.strftime("%Y-%m-%d"),
-    #         lookback_days=lookback_days,
-    #         rebalance_interval_days=rebalance_interval_days,
-    #         output_excel=None,
-    #         output_plots=False,
-    #         benchmark_tickers=None,
-    #         factor_list=None,
-    #         factor_lookback_days=None,
-    #     )
-    #     for sub_start, sub_end in reversed(eval_date_pairs)
-    # ]
-
-    # # Run backtests in parallel
-
-    # # Create a Manager and shared lock for cache synchronization across pool workers
-    # manager = multiprocessing.Manager()
-    # shared_lock = manager.Lock()
-
-    # with Pool(
-    #     NUM_WORKERS, initializer=init_worker_lock, initargs=(shared_lock,)
-    # ) as pool:
-    #     results = list(
-    #         tqdm(
-    #             pool.imap_unordered(_backtest_worker, backtest_configs),
-    #             total=len(backtest_configs),
-    #             desc="Running backtests",
-    #         )
-    #     )
-
-    # # Process results
-    # results_dict = {r[0]: r[1] for r in results}
-    # for sub_start, sub_end in reversed(eval_date_pairs):
-    #     date_key = sub_start.strftime("%Y-%m-%d")
-    #     if date_key in results_dict:
-    #         backtest_result = results_dict[date_key]
-    #         portfolio_summary_over_time.append(backtest_result.portfolio_summary)
-    #         summary_stats_over_time.append(backtest_result.summary_stats)
-
-    # os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
-    # plot_backtest_summary_over_time(
-    #     summary_stats_over_time,
-    #     os.path.join(str(DataConfig.OUTPUT_DIR), "summary_over_time.png"),
-    # )
-
-    # =================== EVAL SETUP ==================
-
-    # Create and run final full backtest with all outputs
-    # Use dynamic S&P 500 constituents to avoid survivorship bias
-    final_config = BacktestConfig(
-        # ticker_list=load_sp100_constituents,
-        ticker_list=load_sp500_constituents,
-        # ticker_list=load_nasdaq100_constituents,
-        # ticker_list=ticker_list,
-        start_backtest_date="2008-04-13",
-        end_backtest_date="2026-04-13",
-        lookback_days=lookback_days,
-        rebalance_interval_days=rebalance_interval_days,
-        # output_excel="backtest_results.xlsx",
-        output_excel=None,
-        output_plots=True,
-        # output_plots=False,
-        benchmark_tickers=benchmark_tickers,
-        factor_list=None,
-        factor_lookback_days=factor_lookback_days,
-        # factor_lookback_days=None,
-        factor_data_file=str(DataConfig.FACTOR_FILE),
-        summary_file="backtest_summary.txt",
-        parallel=True,
-    )
-
-    final_result = run_backtest(final_config)
-
-    print_backtest_summary(
-        final_result.summary_stats,
-        final_result.portfolio_summary,
-        benchmark_metrics=final_result.benchmark_metrics,
-    )
+    execute_runs(plans)
 
 
 if __name__ == "__main__":
