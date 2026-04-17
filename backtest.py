@@ -21,12 +21,15 @@ from tqdm import tqdm
 
 import rossa
 from datamarshal import DataConfig, load_sp100_constituents, load_sp500_constituents, load_nasdaq100_constituents
-from data import init_worker_lock
+from data import init_worker_lock, clean_price_data
 from factor import compute_factor_loadings, load_factor_data
 
 SHORT_AMOUNT = 0.30
-PERIPHERY_THRESHOLD_QUANTILE = 0.05
+PERIPHERY_THRESHOLD_QUANTILE = 0.1
 LONG_PERIPHERY = True
+
+if not LONG_PERIPHERY:
+    PERIPHERY_THRESHOLD_QUANTILE = 1 - PERIPHERY_THRESHOLD_QUANTILE
 
 # ============================================================================
 # BACKTEST CONFIGURATION
@@ -530,6 +533,9 @@ def calculate_portfolio_daily_values(
         prices[(prices.index >= start) & (prices.index <= end)].ffill().copy()
     )
 
+    # CRITICAL FIX: Strip out any duplicate columns before matrix operations
+    prices_filtered = prices_filtered.loc[:, ~prices_filtered.columns.duplicated()]
+
     # Extract sorted rebalance keys
     reb_keys = pd.Series(sorted(list(rebalance_schedule.keys())))
     reb_keys = reb_keys[reb_keys <= end]
@@ -587,13 +593,13 @@ def calculate_portfolio_daily_values(
 
         alloc_series = allocations[reb_key]
         alloc_series = alloc_series[alloc_series.index.isin(rebalance_prices.index)]
-
+        
         target_dollars = alloc_series * portfolio_value
         prices_at_reb = rebalance_prices[alloc_series.index]
 
         # Filter valid prices (not NaN, not 0)
         valid_price_mask = prices_at_reb.notna() & (prices_at_reb != 0)
-        valid_tickers = alloc_series.index[valid_price_mask]
+        valid_tickers = prices_at_reb.index[valid_price_mask]
 
         if len(valid_tickers) == 0:
             continue
@@ -601,6 +607,8 @@ def calculate_portfolio_daily_values(
         # Calculate shares for the entire period
         shares = target_dollars[valid_tickers] / prices_at_reb[valid_tickers]
         shares = shares[shares != 0]
+        # Remove duplicate index labels (keep first occurrence)
+        shares = shares[~shares.index.duplicated(keep='first')]
         valid_tickers = shares.index
 
         if len(valid_tickers) == 0:
@@ -1530,8 +1538,13 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
     if config.benchmark_tickers:
         tickers_to_fetch.extend(config.benchmark_tickers)
 
-    # print num dups in tickers_to_fetch (should be zero if using set logic correctly)
+    # CRITICAL FIX: Remove duplicates to prevent duplicate columns in price_data
+    tickers_to_fetch = list(set(tickers_to_fetch))
+
     price_data = rossa.fetch_and_cache_stock_data(tuple(tickers_to_fetch))
+
+    # CRITICAL FIX: Clean price data (remove penny stocks & data glitches)
+    price_data = clean_price_data(price_data, min_price=1.0, max_price=10000.0)
 
     # Verify data covers the required backtest period
     actual_start = price_data.index[0]
@@ -2000,7 +2013,7 @@ def main() -> None:
     lookback_days = 365
     rebalance_interval_days = 30
     factor_lookback_days = 365 * 3
-    benchmark_tickers = ["SPY", "QQQ"]
+    benchmark_tickers = ["SPY", "QQQ", "IWM"]
 
     # =================== PARAMS ==================
 
@@ -2091,13 +2104,14 @@ def main() -> None:
     final_config = BacktestConfig(
         # ticker_list=load_sp100_constituents,
         # ticker_list=load_sp500_constituents,
-        ticker_list=load_nasdaq100_constituents,
-        start_backtest_date="2015-04-13",
+        # ticker_list=load_nasdaq100_constituents,
+        ticker_list=ticker_list,
+        start_backtest_date="2008-04-13",
         end_backtest_date="2026-04-13",
         lookback_days=lookback_days,
         rebalance_interval_days=rebalance_interval_days,
-        # output_excel="backtest_results.xlsx",
-        output_excel=None,
+        output_excel="backtest_results.xlsx",
+        # output_excel=None,
         output_plots=True,
         # output_plots=False,
         benchmark_tickers=benchmark_tickers,

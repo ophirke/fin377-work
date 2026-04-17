@@ -89,7 +89,7 @@ def _fetch_and_cache_stock_data_factorstoday(
         )
         new_data_dict = {}
 
-        for ticker in missing_tickers:
+        for ticker_idx, ticker in enumerate(missing_tickers, 1):
             try:
                 # Fetch ALL available data from factorstoday.com API by using a very large 'days' parameter
                 url = f"{api_base_url}/stock-history/{ticker}?days=1000000000"
@@ -114,33 +114,49 @@ def _fetch_and_cache_stock_data_factorstoday(
                 my_print_info(f"✗ (error: {e})")
                 new_data_dict[ticker] = pd.Series(dtype=float)
 
-        # Combine all new data into single DataFrame
+            # Checkpoint every 100 tickers
+            if ticker_idx % 100 == 0 or ticker_idx == len(missing_tickers):
+                if new_data_dict:
+                    new_data = pd.DataFrame(new_data_dict)
+                    # Merge with cached data
+                    if cached_data is not None and len(cached_data) > 0:
+                        checkpoint_data = pd.concat([cached_data, new_data], axis=1)
+                    else:
+                        checkpoint_data = new_data
+                    # Save checkpoint
+                    checkpoint_data.to_csv(cache_file)
+                    my_print_info(f"Checkpoint saved: {ticker_idx}/{len(missing_tickers)} tickers downloaded")
+                    # Update cached_data for next checkpoint iteration
+                    cached_data = checkpoint_data
+                    new_data_dict = {}
+
+        # After loop, combine all final data
         if new_data_dict:
             new_data = pd.DataFrame(new_data_dict)
+            if cached_data is not None and len(cached_data) > 0:
+                all_data = pd.concat([cached_data, new_data], axis=1)
+            else:
+                all_data = new_data
         else:
-            new_data = pd.DataFrame()
-
-        # Merge with cached data
-        if cached_data is not None and len(cached_data) > 0:
-            # Align indices and combine (fills with NaN for missing dates in new data)
-            all_data = pd.concat([cached_data, new_data], axis=1)
-        else:
-            all_data = new_data
+            all_data = cached_data if cached_data is not None else pd.DataFrame()
     else:
         if cached_data is None or len(cached_data) == 0:
             raise ValueError(f"No cache found and no tickers to download")
         all_data = cached_data
 
-    # IMPORTANT: Save full merged data to cache (keep all tickers, not just requested)
-    # Only write if something changed (new data was downloaded)
-    if missing_tickers and len(all_data) > 0:
-        all_data.to_csv(cache_file)
-        my_print_info(f"Cache updated: {cache_file}")
+    # IMPORTANT: All data is already saved via checkpoints during the download loop
+    # This final message confirms completion
+    if missing_tickers:
+        if len(all_data) > 0:
+            my_print_info(
+                f"Download complete. Date range: {all_data.index[0].date()} to {all_data.index[-1].date()}"
+            )
+        else:
+            logger.warning("No data to save to cache (all downloads failed)")
+    elif len(all_data) > 0:
         my_print_info(
-            f"Date range: {all_data.index[0].date()} to {all_data.index[-1].date()}"
+            f"Using existing cache with {len(all_data.columns)} tickers, date range: {all_data.index[0].date()} to {all_data.index[-1].date()}"
         )
-    elif missing_tickers and len(all_data) == 0:
-        logger.warning("No data to save to cache (all downloads failed)")
 
     # Keep only the requested tickers for return (but cache has all)
     available_tickers = [t for t in ticker_list if t in all_data.columns]
@@ -203,24 +219,49 @@ def _fetch_and_cache_stock_data_yfinance(
         my_print_info(
             f"Downloading {len(missing_tickers)}/{len(ticker_list)} missing tickers using yfinance (all available history)..."
         )
-        downloaded = yf.download(missing_tickers, period="max", threads=False)
+        
+        # Download in batches of 250 for checkpointing
+        batch_size = 250
+        all_new_data = {}
+        
+        for batch_start in range(0, len(missing_tickers), batch_size):
+            batch_end = min(batch_start + batch_size, len(missing_tickers))
+            batch_tickers = missing_tickers[batch_start:batch_end]
+            
+            my_print_info(f"Downloading batch {batch_start//batch_size + 1} ({batch_start+1}-{batch_end} of {len(missing_tickers)})...")
+            downloaded = yf.download(batch_tickers, period="max", threads=False)
+            
+            # Extract 'Close' from MultiIndex columns (when multiple tickers)
+            if isinstance(downloaded.columns, pd.MultiIndex):
+                batch_data = downloaded.xs("Close", level=0, axis=1)
+            else:
+                batch_data = downloaded[["Close"]]
+            
+            all_new_data.update(batch_data.to_dict('series'))
+            
+            # Checkpoint every batch
+            if len(all_new_data) > 0:
+                new_data = pd.DataFrame(all_new_data)
+                # Merge with cached data
+                if cached_data is not None and len(cached_data) > 0:
+                    checkpoint_data = pd.concat([cached_data, new_data], axis=1)
+                else:
+                    checkpoint_data = new_data
+                # Save checkpoint
+                checkpoint_data.to_csv(cache_file)
+                my_print_info(f"Checkpoint saved: {batch_end}/{len(missing_tickers)} tickers downloaded")
+                # Update cached_data for next batch
+                cached_data = checkpoint_data
 
-        # Extract 'Close' from MultiIndex columns (when multiple tickers)
-        if isinstance(downloaded.columns, pd.MultiIndex):
-            new_data = downloaded.xs("Close", level=0, axis=1)
+        # Final merged data
+        if all_new_data:
+            new_data = pd.DataFrame(all_new_data)
+            if cached_data is not None and len(cached_data) > 0:
+                all_data = pd.concat([cached_data, new_data], axis=1)
+            else:
+                all_data = new_data
         else:
-            new_data = downloaded[["Close"]]
-
-        # CRITICAL FIX: Keep failed tickers with NaN values so they're not re-downloaded
-        # Only drop columns that are completely empty (shouldn't happen), but keep all-NaN columns
-        # from failed downloads to mark them as "attempted but failed"
-
-        # Merge with cached data
-        if cached_data is not None and len(cached_data) > 0:
-            # Align indices and combine (fills with NaN for missing dates in new data)
-            all_data = pd.concat([cached_data, new_data], axis=1)
-        else:
-            all_data = new_data
+            all_data = cached_data if cached_data is not None else pd.DataFrame()
     else:
         if cached_data is None or len(cached_data) == 0:
             raise ValueError(f"No cache found and no tickers to download")
@@ -276,6 +317,56 @@ def _filter_fetched_data(return_data, ticker_list):
         )
 
     return filtered_data
+
+
+def clean_price_data(
+    price_data: pd.DataFrame,
+    min_price: float = 1.0,
+    max_price: float = 10000.0,
+) -> pd.DataFrame:
+    """
+    Clean price data by removing tickers with unrealistic prices.
+    
+    Removes penny stocks (< min_price) and data glitches (> max_price) that can
+    cause portfolio explosions from reverse splits and similar issues.
+    
+    CRITICAL: This function should be called immediately after fetching price data
+    and before any backtesting calculations.
+    
+    Args:
+        price_data: DataFrame with dates as index and tickers as columns (price values)
+        min_price: Minimum acceptable mean price (default $1.00)
+        max_price: Maximum acceptable mean price (default $10,000)
+        
+    Returns:
+        Cleaned DataFrame with unrealistic tickers removed
+    """
+    original_count = len(price_data.columns)
+    
+    # Calculate mean price for each ticker
+    mean_prices = price_data.mean()
+    
+    # Filter to valid price range
+    valid_mask = (mean_prices >= min_price) & (mean_prices <= max_price)
+    valid_tickers = mean_prices[valid_mask].index
+    
+    # Extract cleaned data
+    cleaned_data = price_data[valid_tickers]
+    
+    # Log results
+    removed_count = original_count - len(valid_tickers)
+    if removed_count > 0:
+        penny_stocks = mean_prices[mean_prices < min_price]
+        expensive_stocks = mean_prices[mean_prices > max_price]
+        
+        logger.info(f"Price data cleaning:")
+        logger.info(f"  Original tickers: {original_count}")
+        logger.info(f"  Removed tickers: {removed_count} ({100*removed_count/original_count:.1f}%)")
+        logger.info(f"    - Penny stocks (< ${min_price}): {len(penny_stocks)}")
+        logger.info(f"    - Expensive stocks (> ${max_price}): {len(expensive_stocks)}")
+        logger.info(f"  Remaining tickers: {len(valid_tickers)}")
+    
+    return cleaned_data
 
 
 @lru_cache(maxsize=1)

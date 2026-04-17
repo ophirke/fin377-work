@@ -14,7 +14,7 @@ from matplotlib.lines import Line2D
 from datamarshal import load_sp100_constituents, load_nasdaq100_constituents, load_sp500_constituents
 
 from datamarshal import DataConfig
-from data import fetch_and_cache_stock_data
+from data import fetch_and_cache_stock_data, clean_price_data
 
 # LOGGING CONFIGURATION
 LOG_LEVEL = logging.INFO  # Change to logging.DEBUG for verbose output
@@ -111,10 +111,13 @@ def build_adjacency_matrix(log_returns: pd.DataFrame) -> Tuple[np.ndarray, pd.In
 
     # Adjacency weight transformation: (1 + rho_ij) / 2
     A = (1 + rho.values) / 2
-    np.fill_diagonal(A, 0)  # Remove self-loops
 
-    # Handle NaNs (e.g., zero variance stocks)
-    A = np.nan_to_num(A, nan=0.0)
+    # CRITICAL FIX: Treat NaN correlations (zero variance stocks) as 0 correlation (A = 0.5)
+    # NOT as perfect negative correlation (A = 0.0), which was hunting down dead penny stocks
+    A = np.nan_to_num(A, nan=0.5)
+
+    # Remove self-loops AFTER handling NaNs
+    np.fill_diagonal(A, 0)
 
     return A, tickers
 
@@ -435,6 +438,10 @@ def analyze_core_periphery(
     # Fetch and cache price data
     logger.info(f"\nFetching data for {len(ticker_list)} tickers...")
     price_data = fetch_and_cache_stock_data(tuple(ticker_list))
+
+    # Clean price data (remove penny stocks < $1 and extreme price glitches > $10k)
+    logger.info("\nCleaning price data (removing penny stocks and data glitches)...")
+    price_data = clean_price_data(price_data, min_price=1.0, max_price=10000.0)
 
     # Prepare data for analysis period
     logger.info("\nPreparing price data...")
