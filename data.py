@@ -326,46 +326,56 @@ def clean_price_data(
 ) -> pd.DataFrame:
     """
     Clean price data by removing tickers with unrealistic prices.
-    
-    Removes penny stocks (< min_price) and data glitches (> max_price) that can
-    cause portfolio explosions from reverse splits and similar issues.
-    
+
+    Removes any ticker whose observed price history ever drops below
+    ``min_price`` or rises above ``max_price``. This catches penny stocks and
+    data glitches from reverse splits or bad prints that can cause portfolio
+    explosions in the backtest.
+
     CRITICAL: This function should be called immediately after fetching price data
     and before any backtesting calculations.
-    
+
     Args:
         price_data: DataFrame with dates as index and tickers as columns (price values)
-        min_price: Minimum acceptable mean price (default $1.00)
-        max_price: Maximum acceptable mean price (default $10,000)
-        
+        min_price: Minimum acceptable observed price (default $1.00)
+        max_price: Maximum acceptable observed price (default $10,000)
+
     Returns:
         Cleaned DataFrame with unrealistic tickers removed
     """
     original_count = len(price_data.columns)
-    
-    # Calculate mean price for each ticker
-    mean_prices = price_data.mean()
-    
-    # Filter to valid price range
-    valid_mask = (mean_prices >= min_price) & (mean_prices <= max_price)
-    valid_tickers = mean_prices[valid_mask].index
-    
+
+    # Filter tickers by their full observed price range, not the mean.
+    min_prices = price_data.min(skipna=True)
+    max_prices = price_data.max(skipna=True)
+
+    below_min_mask = min_prices < min_price
+    above_max_mask = max_prices > max_price
+    missing_mask = min_prices.isna() | max_prices.isna()
+
+    valid_mask = ~(below_min_mask | above_max_mask | missing_mask)
+    valid_tickers = price_data.columns[valid_mask]
+
     # Extract cleaned data
     cleaned_data = price_data[valid_tickers]
-    
+
     # Log results
     removed_count = original_count - len(valid_tickers)
     if removed_count > 0:
-        penny_stocks = mean_prices[mean_prices < min_price]
-        expensive_stocks = mean_prices[mean_prices > max_price]
-        
+        penny_stocks = min_prices[below_min_mask]
+        expensive_stocks = max_prices[above_max_mask]
+        missing_tickers = price_data.columns[missing_mask]
+
         logger.info(f"Price data cleaning:")
         logger.info(f"  Original tickers: {original_count}")
-        logger.info(f"  Removed tickers: {removed_count} ({100*removed_count/original_count:.1f}%)")
+        logger.info(
+            f"  Removed tickers: {removed_count} ({100*removed_count/original_count:.1f}%)"
+        )
         logger.info(f"    - Penny stocks (< ${min_price}): {len(penny_stocks)}")
         logger.info(f"    - Expensive stocks (> ${max_price}): {len(expensive_stocks)}")
+        logger.info(f"    - Missing/invalid price history: {len(missing_tickers)}")
         logger.info(f"  Remaining tickers: {len(valid_tickers)}")
-    
+
     return cleaned_data
 
 

@@ -94,6 +94,35 @@ def prepare_price_data(
     return price_data, log_returns
 
 
+def load_analysis_price_data(
+    ticker_list: List[str],
+    price_history_start_date: Optional[str] = None,
+    price_history_end_date: Optional[str] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load the cleaned price window used for coreness analysis.
+
+    This applies date slicing before cleaning so future glitches cannot affect
+    earlier rebalance windows.
+    """
+    logger.info(f"\nFetching data for {len(ticker_list)} tickers...")
+    price_data = fetch_and_cache_stock_data(tuple(ticker_list))
+
+    if price_history_start_date:
+        price_data = price_data[price_data.index >= pd.Timestamp(price_history_start_date)]
+    if price_history_end_date:
+        price_data = price_data[price_data.index <= pd.Timestamp(price_history_end_date)]
+
+    if price_data.empty:
+        raise ValueError("No price data available in the requested analysis window")
+
+    logger.info("\nCleaning price data (removing penny stocks and data glitches)...")
+    price_data = clean_price_data(price_data, min_price=1.0, max_price=10000.0)
+
+    logger.info("\nPreparing price data...")
+    return prepare_price_data(price_data)
+
+
 def build_adjacency_matrix(log_returns: pd.DataFrame) -> Tuple[np.ndarray, pd.Index]:
     """
     Builds weighted adjacency matrix from log returns using Pearson correlation.
@@ -435,18 +464,10 @@ def analyze_core_periphery(
     logger.info("CORE-PERIPHERY ANALYSIS")
     logger.info("=" * 60)
 
-    # Fetch and cache price data
-    logger.info(f"\nFetching data for {len(ticker_list)} tickers...")
-    price_data = fetch_and_cache_stock_data(tuple(ticker_list))
-
-    # Clean price data (remove penny stocks < $1 and extreme price glitches > $10k)
-    logger.info("\nCleaning price data (removing penny stocks and data glitches)...")
-    price_data = clean_price_data(price_data, min_price=1.0, max_price=10000.0)
-
-    # Prepare data for analysis period
-    logger.info("\nPreparing price data...")
-    price_data, log_returns = prepare_price_data(
-        price_data, start_date=price_history_start_date, end_date=price_history_end_date
+    price_data, log_returns = load_analysis_price_data(
+        ticker_list=ticker_list,
+        price_history_start_date=price_history_start_date,
+        price_history_end_date=price_history_end_date,
     )
 
     # Build correlation matrix
