@@ -45,6 +45,7 @@ def create_backtests():
         rebalance_interval_days=rebalance_interval_days,
         output_excel=None,
         output_plots=False,
+        do_plot_network=False,
         benchmark_tickers=benchmark_tickers,
         factor_list=None,
         factor_lookback_days=None,
@@ -64,30 +65,32 @@ def create_backtests():
                 base_config,
                 output_excel="backtest_results.xlsx",
                 output_plots=True,
+                do_plot_network=True,
                 summary_file="backtest_summary.txt",
                 factor_lookback_days=factor_lookback_days,
             ),
         )
     )
 
-    # plans.append(
-    #     StepForwardBacktestRun(
-    #         name="sp500_step_forward",
-    #         base_config=replace(
-    #             base_config,
-    #             output_plots=False,
-    #             output_excel=None,
-    #             summary_file=None,
-    #             factor_lookback_days=None,
-    #         ),
-    #         overall_start_date="2008-04-13",
-    #         overall_end_date="2026-04-13",
-    #         eval_lookback=pd.DateOffset(years=1),
-    #         eval_interval=pd.DateOffset(months=1),
-    #         summary_plot_filename="summary_over_time.png",
-    #         parallel=True,
-    #     )
-    # )
+    plans.append(
+        StepForwardBacktestRun(
+            name="sp500_step_forward",
+            base_config=replace(
+                base_config,
+                output_plots=False,
+                output_excel=None,
+                summary_file=None,
+                factor_lookback_days=None,
+                parallel=False,
+            ),
+            overall_start_date="2008-04-13",
+            overall_end_date="2026-04-13",
+            eval_lookback=pd.DateOffset(years=1),
+            eval_interval=pd.DateOffset(months=1),
+            summary_plot_filename="summary_over_time.png",
+            parallel=True,
+        )
+    )
 
     return plans
 

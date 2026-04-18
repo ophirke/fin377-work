@@ -424,13 +424,14 @@ def compute_factor_loadings_iterative(
     market_factor: str = "Market",
     confidence_threshold: float = 0.95,
     min_factor_coverage: float = 1.0,
+    force_market_factor: bool = True,
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     Compute factor loadings via OLS regression with iterative significance pruning.
 
     Non-market factors are pruned repeatedly until every remaining non-market
     factor is significant at the requested threshold. The market factor may be
-    retained even when it is not significant.
+    retained even when it is not significant if ``force_market_factor`` is True.
     """
     logger.info("=" * 70)
     logger.info("FACTOR LOADINGS ANALYSIS")
@@ -533,14 +534,19 @@ def compute_factor_loadings_iterative(
                 f"  {row['Factor']:15s}: t={row['t_stat']:7.3f}, p={row['p_value']:.4f} {sig_marker}"
             )
 
-        insignificant_factors = results_current.loc[
-            ~results_current["Significant"]
-            & (results_current["Factor"] != market_factor),
-            "Factor",
-        ].tolist()
+        if force_market_factor:
+            insignificant_factors = results_current.loc[
+                ~results_current["Significant"]
+                & (results_current["Factor"] != market_factor),
+                "Factor",
+            ].tolist()
+        else:
+            insignificant_factors = results_current.loc[
+                ~results_current["Significant"], "Factor"
+            ].tolist()
 
         if not insignificant_factors:
-            if market_factor in current_factors:
+            if force_market_factor and market_factor in current_factors:
                 market_row = results_current[
                     results_current["Factor"] == market_factor
                 ]
@@ -568,6 +574,8 @@ def compute_factor_loadings_iterative(
         "adj_r_squared": model_final.rsquared_adj,
         "n_obs": len(y),
         "residual_std_error": np.sqrt(model_final.mse_resid),
+        "sample_start": y.index.min(),
+        "sample_end": y.index.max(),
         "coefficient_pvalues": {
             ("Intercept" if factor == "const" else factor): p_value
             for factor, p_value in model_final.pvalues.items()

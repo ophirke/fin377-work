@@ -1,0 +1,48 @@
+======================================================================
+BACKTEST SUMMARY
+======================================================================
+
+STRATEGY PERFORMANCE METRICS
+----------------------------------------------------------------------
+Total Return:                         1094.28%
+Annualized Return (geometric):          14.75%
+Arithmetic Average Return:              16.18%
+Volatility (annualized):                21.98%
+Volatility Drag:                         2.42%
+
+RISK-ADJUSTED METRICS
+----------------------------------------------------------------------
+Sharpe Ratio:                          0.5347
+Sortino Ratio:                         0.7698
+Max Drawdown:                           48.50%
+
+PORTFOLIO VALUES
+----------------------------------------------------------------------
+Initial Capital:                 $  100,000.00
+Final Portfolio Value:           $1,194,275.38
+
+======================================================================
+BENCHMARK COMPARISON
+======================================================================
+
+SPY
+----------------------------------------------------------------------
+Total Return:                          620.99%
+Annualized Return (geometric):          11.58%
+Arithmetic Average Return:              12.92%
+Volatility (annualized):                19.80%
+Sharpe Ratio:                          0.4335
+Sortino Ratio:                         0.6123
+Max Drawdown:                           51.48%
+
+IWM
+----------------------------------------------------------------------
+Total Return:                          395.70%
+Annualized Return (geometric):           9.29%
+Arithmetic Average Return:              11.97%
+Volatility (annualized):                24.82%
+Sharpe Ratio:                          0.2534
+Sortino Ratio:                         0.3565
+Max Drawdown:                           54.24%
+
+======================================================================

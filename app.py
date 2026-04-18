@@ -164,6 +164,10 @@ def _build_config_from_sidebar(default_config: Optional[BacktestConfig]) -> Back
         "Generate plot files",
         value=default_config.output_plots if default_config else True,
     )
+    do_plot_network = st.sidebar.checkbox(
+        "Plot last snapshot network",
+        value=default_config.do_plot_network if default_config else False,
+    )
     output_excel_enabled = st.sidebar.checkbox(
         "Generate Excel file",
         value=bool(default_config.output_excel) if default_config else True,
@@ -209,6 +213,7 @@ def _build_config_from_sidebar(default_config: Optional[BacktestConfig]) -> Back
         rebalance_interval_days=int(rebalance_interval_days),
         output_excel=output_excel if output_excel_enabled else None,
         output_plots=output_plots,
+        do_plot_network=do_plot_network,
         benchmark_tickers=[ticker.strip().upper() for ticker in benchmark_tickers.split(",") if ticker.strip()],
         factor_list=None,
         factor_lookback_days=None,
@@ -418,7 +423,7 @@ def _render_output_files() -> None:
     ]
     st.dataframe(pd.DataFrame(file_rows), use_container_width=True)
 
-    for image_name in ["backtest_plots.png", "backtest_plots_log.png"]:
+    for image_name in ["backtest_plots.png", "backtest_plots_log.png", "last_snap_network.png"]:
         image_path = output_dir / image_name
         if image_path.exists():
             st.image(str(image_path), caption=image_name, use_container_width=True)

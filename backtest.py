@@ -12,8 +12,10 @@ import os
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from multiprocessing import Pool
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -50,7 +52,9 @@ class StrategyConfig:
     short_amount: float = 0.90
     periphery_threshold_quantile: float = 0.05
     long_periphery: bool = True
-    weighting_method: str = "equal"  # Options: "equal", "coreness_proportional", "markowitz_min_vol"
+    weighting_method: str = (
+        "equal"  # Options: "equal", "coreness_proportional", "markowitz_min_vol"
+    )
     max_long_weight: Optional[float] = None
     max_short_weight: Optional[float] = None
 
@@ -104,6 +108,7 @@ class BacktestConfig:
     rebalance_interval_days: int
     output_excel: Optional[str] = None
     output_plots: bool = False
+    do_plot_network: bool = False
     benchmark_tickers: Optional[List[str]] = None
     factor_list: Optional[List[str]] = None
     factor_lookback_days: Optional[int] = None
@@ -721,9 +726,9 @@ def _allocate_coreness_proportional(
 
     allocations_df = results_df.copy()
     allocations_df["Allocation"] = 0.0
-    allocations_df.loc[is_long, "Allocation"] = allocations_df.loc[is_long, "Stock"].map(
-        long_weights
-    )
+    allocations_df.loc[is_long, "Allocation"] = allocations_df.loc[
+        is_long, "Stock"
+    ].map(long_weights)
     allocations_df.loc[is_short, "Allocation"] = -allocations_df.loc[
         is_short, "Stock"
     ].map(short_weights)
@@ -848,7 +853,9 @@ def allocate_by_coreness(
 
     total_alloc = allocations_df["Allocation"].sum()
     if not np.isclose(total_alloc, strategy_config.target_net_exposure):
-        raise ValueError(f"Total allocation sums to {total_alloc:.4f}, expected {strategy_config.target_net_exposure:.4f}")
+        raise ValueError(
+            f"Total allocation sums to {total_alloc:.4f}, expected {strategy_config.target_net_exposure:.4f}"
+        )
 
     allocations_df = allocations_df.sort_values("Coreness", ascending=True).reset_index(
         drop=True
@@ -1188,7 +1195,9 @@ def compute_portfolio_snapshots(
     if daily_holdings.empty or not rebalance_schedule:
         return pd.DataFrame()
 
-    available_dates = pd.Index(pd.to_datetime(daily_holdings["Date"]).drop_duplicates().sort_values())
+    available_dates = pd.Index(
+        pd.to_datetime(daily_holdings["Date"]).drop_duplicates().sort_values()
+    )
     snapshot_frames = []
 
     for rebalance_date, allocation_df in sorted(rebalance_schedule.items()):
@@ -1197,7 +1206,9 @@ def compute_portfolio_snapshots(
             continue
 
         effective_date = effective_candidates[0]
-        holdings_slice = daily_holdings[pd.to_datetime(daily_holdings["Date"]) == effective_date].copy()
+        holdings_slice = daily_holdings[
+            pd.to_datetime(daily_holdings["Date"]) == effective_date
+        ].copy()
         if holdings_slice.empty:
             continue
 
@@ -1250,6 +1261,76 @@ def compute_portfolio_snapshots(
         ["Snapshot_Date", "Action", "Coreness_Rank", "Ticker"]
     ).reset_index(drop=True)
     return snapshots_df
+
+
+def plot_last_snapshot_network(
+    portfolio_snapshots: pd.DataFrame,
+    lookback_days: int,
+    output_dir: str,
+    corr_threshold: float = 0.55,
+) -> Optional[str]:
+    """Plot the core-periphery network for the most recent portfolio snapshot."""
+    if portfolio_snapshots is None or portfolio_snapshots.empty:
+        logger.info("Skipping last snapshot network plot: no snapshot data available")
+        return None
+
+    latest_snapshot_date = pd.to_datetime(portfolio_snapshots["Snapshot_Date"]).max()
+    snapshot_df = portfolio_snapshots[
+        pd.to_datetime(portfolio_snapshots["Snapshot_Date"]) == latest_snapshot_date
+    ].copy()
+
+    tickers = sorted(snapshot_df["Ticker"].dropna().unique().tolist())
+    if len(tickers) < 2:
+        logger.info("Skipping last snapshot network plot: need at least two tickers")
+        return None
+
+    lookback_start = latest_snapshot_date - timedelta(days=lookback_days)
+    analysis_end_date = latest_snapshot_date - timedelta(days=1)
+
+    _, log_returns = rossa.load_analysis_price_data(
+        ticker_list=tickers,
+        price_history_start_date=lookback_start.strftime("%Y-%m-%d"),
+        price_history_end_date=analysis_end_date.strftime("%Y-%m-%d"),
+    )
+    A, ticker_names = rossa.build_adjacency_matrix(log_returns)
+    if len(ticker_names) < 2:
+        logger.info("Skipping last snapshot network plot: insufficient cleaned tickers")
+        return None
+
+    results = rossa.rossa_core_periphery(A, ticker_names)
+    latest_weights = (
+        snapshot_df[["Ticker", "Portfolio_Weight"]]
+        .dropna(subset=["Ticker", "Portfolio_Weight"])
+        .drop_duplicates(subset=["Ticker"], keep="last")
+        .set_index("Ticker")["Portfolio_Weight"]
+    )
+    abs_weights = latest_weights.abs()
+    max_abs_weight = float(abs_weights.max()) if not abs_weights.empty else 1.0
+
+    node_size_map = {}
+    node_alpha_map = {}
+    for ticker in ticker_names:
+        weight = float(latest_weights.get(ticker, 0.0))
+        strength = abs(weight) / max(max_abs_weight, 1e-10)
+        if weight >= 0:
+            node_size_map[ticker] = 500 + 2200 * strength
+            node_alpha_map[ticker] = 0.9
+        else:
+            node_size_map[ticker] = 120 + 600 * strength
+            node_alpha_map[ticker] = 0.2
+
+    output_path = os.path.join(output_dir, "last_snap_network.png")
+    rossa.plot_network(
+        A=A,
+        ticker_names=ticker_names,
+        results=results,
+        filename=output_path,
+        corr_threshold=corr_threshold,
+        node_size_map=node_size_map,
+        node_alpha_map=node_alpha_map,
+        edge_alpha_scale=0.18,
+    )
+    return output_path
 
 
 def _renormalize_snapshot_weights(
@@ -1324,7 +1405,9 @@ def _compute_snapshot_portfolio_returns(
         "Actual_Lookback_End": asset_returns.index.max(),
         "Requested_Num_Positions": int(snapshot_df["Ticker"].nunique()),
         "Used_Num_Positions": int(len(valid_tickers)),
-        "Dropped_Num_Positions": int(snapshot_df["Ticker"].nunique() - len(valid_tickers)),
+        "Dropped_Num_Positions": int(
+            snapshot_df["Ticker"].nunique() - len(valid_tickers)
+        ),
         "Requested_Gross_Long_Weight": original_long_gross,
         "Requested_Gross_Short_Weight": original_short_gross,
         "Used_Gross_Long_Weight": float(weights[weights > 0].sum()),
@@ -1376,7 +1459,9 @@ def compute_snapshot_factor_exposures(
                 snapshot_df, price_data, lookback_days
             )
         except Exception as exc:
-            logger.warning(f"Snapshot {pd.Timestamp(snapshot_date).date()}: exposure calc skipped ({exc})")
+            logger.warning(
+                f"Snapshot {pd.Timestamp(snapshot_date).date()}: exposure calc skipped ({exc})"
+            )
             continue
 
         base_record = {
@@ -1390,12 +1475,14 @@ def compute_snapshot_factor_exposures(
                 continue
 
             try:
-                exposures_df, diagnostics = compute_factor_exposures(
+                exposures_df, diagnostics = compute_factor_loadings(
                     portfolio_returns=portfolio_returns,
                     factor_returns=factor_returns,
                     factors=selected_factors,
                     market_factor="Market",
+                    confidence_threshold=0.95,
                     min_factor_coverage=0.7,
+                    force_market_factor=False,
                 )
             except Exception as exc:
                 logger.warning(
@@ -1417,7 +1504,6 @@ def compute_snapshot_factor_exposures(
             coefficient_loadings = diagnostics.get("coefficient_loadings", {})
             coefficient_pvalues = diagnostics.get("coefficient_pvalues", {})
             record["Intercept"] = coefficient_loadings.get("Intercept", np.nan)
-            record["PValue:Intercept"] = coefficient_pvalues.get("Intercept", np.nan)
             exposure_map = dict(zip(exposures_df["Factor"], exposures_df["Loading"]))
             pvalue_map = dict(zip(exposures_df["Factor"], exposures_df["p_value"]))
             for factor_name in selected_factors:
@@ -1426,7 +1512,9 @@ def compute_snapshot_factor_exposures(
             exposures_by_set[factor_set_name].append(record)
 
     return {
-        factor_set_name: pd.DataFrame(records).sort_values("Snapshot_Date").reset_index(drop=True)
+        factor_set_name: pd.DataFrame(records)
+        .sort_values("Snapshot_Date")
+        .reset_index(drop=True)
         for factor_set_name, records in exposures_by_set.items()
         if records
     }
@@ -1456,7 +1544,9 @@ def export_benchmark_data_to_excel(
     with pd.ExcelWriter(
         output_filename, engine="openpyxl", mode="a", if_sheet_exists="replace"
     ) as writer:
-        _write_benchmark_sheets(writer, benchmark_data, benchmark_metrics, export_config)
+        _write_benchmark_sheets(
+            writer, benchmark_data, benchmark_metrics, export_config
+        )
 
     logger.info(f"Benchmark data exported to Excel: {output_filename}")
 
@@ -1514,13 +1604,17 @@ def _write_dataframe_sheet(
     headers = export_df.columns.tolist()
     worksheet.write_row(0, 0, headers)
 
-    for row_idx, row in enumerate(export_df.itertuples(index=False, name=None), start=1):
+    for row_idx, row in enumerate(
+        export_df.itertuples(index=False, name=None), start=1
+    ):
         for col_idx, value in enumerate(row):
             if pd.isna(value):
                 continue
             if isinstance(value, pd.Timestamp):
                 if value.time() == pd.Timestamp(value.date()).time():
-                    worksheet.write_datetime(row_idx, col_idx, value.to_pydatetime(), date_format)
+                    worksheet.write_datetime(
+                        row_idx, col_idx, value.to_pydatetime(), date_format
+                    )
                 else:
                     worksheet.write_datetime(
                         row_idx, col_idx, value.to_pydatetime(), datetime_format
@@ -1579,7 +1673,9 @@ def _write_backtest_sheets(
         .first()
         .unstack()
     )
-    _write_wide_timeseries_sheet(writer, position_pivot, sheet_name="Position Values ($)")
+    _write_wide_timeseries_sheet(
+        writer, position_pivot, sheet_name="Position Values ($)"
+    )
 
     # Pivot prices by ticker (optional, for reference)
     price_pivot = (
@@ -1611,7 +1707,9 @@ def _write_backtest_sheets(
         if metric in portfolio_export.columns:
             metric_df = portfolio_export[["Date", metric]].copy()
             sheet_name = metric.replace("_", " ")
-            _write_dataframe_sheet(writer, metric_df, sheet_name=sheet_name, index=False)
+            _write_dataframe_sheet(
+                writer, metric_df, sheet_name=sheet_name, index=False
+            )
 
     # Sheet 3: Performance Metrics
     metrics_data = [
@@ -1938,9 +2036,10 @@ def plot_backtest_results_log(
     """
     fig, axes = plt.subplots(2, 1, figsize=(14, 8))
 
-    strategy_growth = portfolio_summary["Portfolio_Value"] / portfolio_summary[
-        "Portfolio_Value"
-    ].iloc[0]
+    strategy_growth = (
+        portfolio_summary["Portfolio_Value"]
+        / portfolio_summary["Portfolio_Value"].iloc[0]
+    )
 
     axes[0].plot(
         portfolio_summary["Date"],
@@ -1962,7 +2061,9 @@ def plot_backtest_results_log(
     if benchmark_data:
         colors = plt.cm.Set2(np.linspace(0, 1, len(benchmark_data)))
         for (ticker, bench_df), color in zip(benchmark_data.items(), colors):
-            benchmark_growth = bench_df["Portfolio_Value"] / bench_df["Portfolio_Value"].iloc[0]
+            benchmark_growth = (
+                bench_df["Portfolio_Value"] / bench_df["Portfolio_Value"].iloc[0]
+            )
             axes[0].plot(
                 bench_df["Date"],
                 bench_df["Portfolio_Value"],
@@ -1981,7 +2082,9 @@ def plot_backtest_results_log(
             )
 
     axes[0].set_yscale("log")
-    axes[0].set_title("Portfolio Value Over Time (Log Scale)", fontsize=14, fontweight="bold")
+    axes[0].set_title(
+        "Portfolio Value Over Time (Log Scale)", fontsize=14, fontweight="bold"
+    )
     axes[0].set_xlabel("Date")
     axes[0].set_ylabel("Portfolio Value ($, log)")
     axes[0].grid(True, alpha=0.3, which="both")
@@ -2217,7 +2320,10 @@ def compute_factor_loadings_over_time(
         col for col in factor_loadings_df.columns if col != "Rebalance_Date"
     )
     for required_col in ["Intercept", "Market"]:
-        if required_col in factor_pvalues_df.columns and required_col not in retained_columns:
+        if (
+            required_col in factor_pvalues_df.columns
+            and required_col not in retained_columns
+        ):
             retained_columns.append(required_col)
     factor_pvalues_df = factor_pvalues_df.reindex(columns=retained_columns)
 
@@ -2448,7 +2554,9 @@ def export_snapshot_analysis_files(
         if exposure_df is None or exposure_df.empty:
             continue
         exposure_df.to_csv(
-            os.path.join(output_dir, filename_map.get(factor_set_name, f"{factor_set_name}.csv")),
+            os.path.join(
+                output_dir, filename_map.get(factor_set_name, f"{factor_set_name}.csv")
+            ),
             index=False,
         )
 
@@ -2544,7 +2652,9 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
     portfolio_summary, summary_stats = calculate_portfolio_metrics(daily_holdings)
 
     # Build portfolio snapshots and factor exposures at each rebalance
-    portfolio_snapshots = compute_portfolio_snapshots(daily_holdings, rebalance_schedule)
+    portfolio_snapshots = compute_portfolio_snapshots(
+        daily_holdings, rebalance_schedule
+    )
     snapshot_factor_exposures = {}
     snapshot_factor_lookback_days = (
         config.snapshot_factor_lookback_days
@@ -2637,6 +2747,17 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
                 benchmark_stats_over_time, output_dir=str(DataConfig.OUTPUT_DIR)
             )
 
+    if config.do_plot_network:
+        os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
+        try:
+            plot_last_snapshot_network(
+                portfolio_snapshots=portfolio_snapshots,
+                lookback_days=config.lookback_days,
+                output_dir=str(DataConfig.OUTPUT_DIR),
+            )
+        except Exception as exc:
+            logger.warning(f"Last snapshot network plot failed: {exc}")
+
     # Print summary statistics
     print_backtest_summary(summary_stats, portfolio_summary, benchmark_metrics)
 
@@ -2647,12 +2768,14 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
 
     if config.factor_lookback_days is not None and config.factor_lookback_days > 0:
         logger.info("[6/6] Computing factor analysis...")
-        factor_loadings_df, factor_pvalues_df, rsquared_series = compute_factor_loadings_over_time(
-            portfolio_summary=portfolio_summary,
-            rebalance_dates=rebalance_dates,
-            factor_lookback_days=config.factor_lookback_days,
-            factor_list=config.factor_list,
-            factor_data_file=config.factor_data_file,
+        factor_loadings_df, factor_pvalues_df, rsquared_series = (
+            compute_factor_loadings_over_time(
+                portfolio_summary=portfolio_summary,
+                rebalance_dates=rebalance_dates,
+                factor_lookback_days=config.factor_lookback_days,
+                factor_list=config.factor_list,
+                factor_data_file=config.factor_data_file,
+            )
         )
 
         if factor_loadings_df is not None:
@@ -2708,7 +2831,7 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
     )
 
 
-def _backtest_worker(config: BacktestConfig) -> Tuple[str, BacktestResult]:
+def _backtest_worker(args: Tuple[BacktestConfig, Set[str]]) -> Tuple[str, BacktestResult]:
     """
     Worker function for parallel backtest execution.
     Returns: (start_date_str, BacktestResult)
@@ -2716,6 +2839,10 @@ def _backtest_worker(config: BacktestConfig) -> Tuple[str, BacktestResult]:
     # Disable logging in worker threads
     logging.disable(logging.CRITICAL)
 
+    config, tickers_to_fetch = args
+    
+    _ = rossa.fetch_and_cache_stock_data(tuple(tickers_to_fetch))
+    
     result = run_backtest(config)
     return (config.start_backtest_date, result)
 
@@ -2789,6 +2916,23 @@ def run_step_forward_evaluation(
         f"Running {len(backtest_configs)} step-forward backtests for {plan.name}"
     )
 
+    # figure out all the tickers across all steps to optimize data fetch
+    all_tickers_set = set()
+    for config in backtest_configs:
+        if callable(config.ticker_list):
+            tickers = config.ticker_list(config.start_backtest_date)
+            all_tickers_set.update(tickers)
+        else:
+            all_tickers_set.update(config.ticker_list)
+        if config.benchmark_tickers:
+            all_tickers_set.update(config.benchmark_tickers)
+    tickers_to_fetch = list(all_tickers_set)
+    logger.info(
+        f"Step-forward evaluation will fetch data for {len(all_tickers_set)} unique tickers across all steps"
+    )
+    
+    backtest_worker_args = list(zip(backtest_configs, [tickers_to_fetch] * len(backtest_configs)))
+
     if plan.parallel and len(backtest_configs) > 1:
         manager = multiprocessing.Manager()
         shared_lock = manager.Lock()
@@ -2797,13 +2941,13 @@ def run_step_forward_evaluation(
         ) as pool:
             results = list(
                 tqdm(
-                    pool.imap_unordered(_backtest_worker, backtest_configs),
-                    total=len(backtest_configs),
+                    pool.imap_unordered(_backtest_worker, backtest_worker_args),
+                    total=len(backtest_worker_args),
                     desc=f"Running {plan.name}",
                 )
             )
     else:
-        results = [_backtest_worker(config) for config in backtest_configs]
+        results = [_backtest_worker(args) for args in backtest_worker_args]
 
     results_dict = {start_date: result for start_date, result in results}
     summary_stats_over_time = []

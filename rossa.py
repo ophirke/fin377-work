@@ -4,12 +4,15 @@ import sys
 from datetime import datetime
 from typing import List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
 from datamarshal import load_sp100_constituents, load_nasdaq100_constituents, load_sp500_constituents
 
@@ -284,6 +287,9 @@ def plot_network(
     results: pd.DataFrame,
     filename: str,
     corr_threshold: float = 0.3,
+    node_size_map: Optional[dict] = None,
+    node_alpha_map: Optional[dict] = None,
+    edge_alpha_scale: float = 0.3,
 ) -> None:
     """
     Visualizes stock correlation network using a force-directed structure.
@@ -299,6 +305,9 @@ def plot_network(
         results: DataFrame with coreness scores
         filename: Output PNG filename
         corr_threshold: Minimum correlation magnitude to show edge
+        node_size_map: Optional per-ticker node sizes
+        node_alpha_map: Optional per-ticker node alpha values
+        edge_alpha_scale: Multiplier to reduce overall edge opacity
     """
     G = nx.Graph()
 
@@ -370,7 +379,7 @@ def plot_network(
             )
 
             linewidth = 0.5 + 4.5 * norm_weight
-            alpha = 0.2 + 0.7 * norm_weight
+            alpha = (0.2 + 0.7 * norm_weight) * edge_alpha_scale
 
             # Color by sign
             if weight > 0:
@@ -381,32 +390,62 @@ def plot_network(
             ax.plot(x, y, "-", color=color, alpha=alpha, linewidth=linewidth, zorder=1)
 
     # Draw nodes colored by coreness
-    node_colors = [coreness_dict[node] for node in G.nodes()]
-    node_sizes = [
-        200 + 600 * (max_core - (coreness_dict[node] - min_core)) / (max_core - min_core + 1e-10)
-        for node in G.nodes()
-    ]
+    node_order = list(G.nodes())
+    node_colors = np.array([coreness_dict[node] for node in node_order], dtype=float)
+    if node_size_map is None:
+        node_sizes = np.array(
+            [
+                200
+                + 600
+                * (max_core - (coreness_dict[node] - min_core))
+                / (max_core - min_core + 1e-10)
+                for node in node_order
+            ],
+            dtype=float,
+        )
+    else:
+        node_sizes = np.array(
+            [float(node_size_map.get(node, 250.0)) for node in node_order], dtype=float
+        )
+
+    if node_alpha_map is None:
+        node_alphas = np.full(len(node_order), 0.8, dtype=float)
+    else:
+        node_alphas = np.array(
+            [float(node_alpha_map.get(node, 0.8)) for node in node_order], dtype=float
+        )
+
+    norm = Normalize(vmin=min_core, vmax=max_core)
+    facecolors = plt.cm.RdYlGn(norm(node_colors))
+    facecolors[:, 3] = node_alphas
 
     nodes = ax.scatter(
-        [pos[node][0] for node in G.nodes()],
-        [pos[node][1] for node in G.nodes()],
-        c=node_colors,
+        [pos[node][0] for node in node_order],
+        [pos[node][1] for node in node_order],
         s=node_sizes,
-        cmap="RdYlGn",
-        alpha=0.8,
+        facecolors=facecolors,
         edgecolors="black",
-        linewidth=1.5,
-        vmin=min_core,
-        vmax=max_core,
+        linewidth=1.2,
         zorder=2,
     )
 
     # Label nodes
     for node, (x, y) in pos.items():
-        ax.text(x, y, node, ha="center", va="center", fontsize=9, fontweight="bold")
+        ax.text(
+            x,
+            y,
+            node,
+            ha="center",
+            va="center",
+            fontsize=9,
+            fontweight="bold",
+            alpha=max(0.45, float(node_alpha_map.get(node, 0.8)) if node_alpha_map else 0.8),
+        )
 
     # Add colorbar
-    cbar = plt.colorbar(nodes, ax=ax, fraction=0.046, pad=0.04)
+    cbar = plt.colorbar(
+        plt.cm.ScalarMappable(norm=norm, cmap="RdYlGn"), ax=ax, fraction=0.046, pad=0.04
+    )
     cbar.set_label("Coreness Score", fontsize=12)
 
     # Add legend
