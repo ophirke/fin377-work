@@ -13,6 +13,7 @@ from functools import cache, lru_cache
 from pathlib import Path
 from typing import Tuple
 
+import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
@@ -325,15 +326,17 @@ def clean_price_data(
     max_price: float = 10000.0,
 ) -> pd.DataFrame:
     """
-    Clean price data by removing tickers with unrealistic prices.
+    Filter a bounded analysis window by removing tickers with unrealistic prices.
 
     Removes any ticker whose observed price history ever drops below
     ``min_price`` or rises above ``max_price``. This catches penny stocks and
     data glitches from reverse splits or bad prints that can cause portfolio
     explosions in the backtest.
 
-    CRITICAL: This function should be called immediately after fetching price data
-    and before any backtesting calculations.
+    This is intended for eligibility filtering inside a local analysis window
+    such as a rebalance lookback period. It should not be used to globally
+    delete tickers from realized PnL paths, because doing so can introduce
+    lookahead bias.
 
     Args:
         price_data: DataFrame with dates as index and tickers as columns (price values)
@@ -377,6 +380,32 @@ def clean_price_data(
         logger.info(f"  Remaining tickers: {len(valid_tickers)}")
 
     return cleaned_data
+
+
+def mask_invalid_price_cells(
+    price_data: pd.DataFrame,
+    min_price: float = 1.0,
+    max_price: float = 10000.0,
+) -> pd.DataFrame:
+    """
+    Replace invalid individual price observations with NaN.
+
+    This preserves the ticker in the panel while removing bad prints from the
+    realized valuation path. Downstream consumers can then forward-fill the last
+    valid observation without retroactively dropping the security.
+
+    Args:
+        price_data: DataFrame with dates as index and tickers as columns
+        min_price: Minimum acceptable observed price (default $1.00)
+        max_price: Maximum acceptable observed price (default $10,000)
+
+    Returns:
+        DataFrame with invalid cells masked to NaN
+    """
+    cleaned = price_data.copy()
+    numeric = cleaned.apply(pd.to_numeric, errors="coerce")
+    invalid_mask = (~np.isfinite(numeric)) | (numeric < min_price) | (numeric > max_price)
+    return numeric.mask(invalid_mask)
 
 
 @lru_cache(maxsize=1)

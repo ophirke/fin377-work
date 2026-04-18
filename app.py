@@ -89,6 +89,19 @@ def _build_config_from_sidebar(default_config: Optional[BacktestConfig]) -> Back
         value=default_config.rebalance_interval_days if default_config else 30,
         step=1,
     )
+    snapshot_factor_lookback_days = st.sidebar.number_input(
+        "Snapshot factor lookback days",
+        min_value=30,
+        max_value=5000,
+        value=(
+            default_config.snapshot_factor_lookback_days
+            or default_config.factor_lookback_days
+            or default_config.lookback_days
+        )
+        if default_config
+        else 365,
+        step=5,
+    )
 
     benchmark_tickers = st.sidebar.text_input(
         "Benchmarks",
@@ -199,6 +212,7 @@ def _build_config_from_sidebar(default_config: Optional[BacktestConfig]) -> Back
         benchmark_tickers=[ticker.strip().upper() for ticker in benchmark_tickers.split(",") if ticker.strip()],
         factor_list=None,
         factor_lookback_days=None,
+        snapshot_factor_lookback_days=int(snapshot_factor_lookback_days),
         factor_data_file=str(DataConfig.FACTOR_FILE),
         summary_file=summary_file if summary_enabled else None,
         parallel=parallel,
@@ -282,6 +296,106 @@ def _render_tables(result: BacktestResult) -> None:
                 st.dataframe(bench_df, use_container_width=True)
 
 
+def _render_snapshots(result: BacktestResult) -> None:
+    st.subheader("Portfolio Snapshots")
+    snapshots = result.portfolio_snapshots
+    if snapshots is None or snapshots.empty:
+        st.info("No portfolio snapshots available.")
+        return
+
+    snapshot_dates = pd.to_datetime(snapshots["Snapshot_Date"]).drop_duplicates().sort_values()
+    selected_snapshot = st.selectbox(
+        "Snapshot date",
+        options=snapshot_dates,
+        format_func=lambda value: pd.Timestamp(value).strftime("%Y-%m-%d"),
+    )
+
+    snapshot_df = snapshots[pd.to_datetime(snapshots["Snapshot_Date"]) == pd.Timestamp(selected_snapshot)].copy()
+    snapshot_df = snapshot_df.sort_values(["Action", "Coreness_Rank", "Ticker"])
+
+    cols = st.columns(4)
+    cols[0].metric("Effective date", pd.Timestamp(snapshot_df["Effective_Date"].iloc[0]).strftime("%Y-%m-%d"))
+    cols[1].metric("Positions", str(snapshot_df["Ticker"].nunique()))
+    cols[2].metric("Gross long", f"{snapshot_df.loc[snapshot_df['Portfolio_Weight'] > 0, 'Portfolio_Weight'].sum():.3f}")
+    cols[3].metric("Gross short", f"{-snapshot_df.loc[snapshot_df['Portfolio_Weight'] < 0, 'Portfolio_Weight'].sum():.3f}")
+
+    st.dataframe(snapshot_df, use_container_width=True)
+
+    exposure_tables = result.snapshot_factor_exposures or {}
+    if not exposure_tables:
+        st.info("No snapshot factor exposures available.")
+        return
+
+    exposure_labels = {
+        "market_general": "Market + General",
+        "market_general_sectors": "Market + General + Sectors",
+        "market_general_sectors_industries": "Market + General + Sectors + Industries",
+    }
+    exposure_tabs = st.tabs(
+        [exposure_labels.get(name, name) for name in exposure_tables.keys()]
+    )
+
+    for tab, (factor_set_name, exposure_df) in zip(exposure_tabs, exposure_tables.items()):
+        with tab:
+            selected_row = exposure_df[
+                pd.to_datetime(exposure_df["Snapshot_Date"]) == pd.Timestamp(selected_snapshot)
+            ]
+            if selected_row.empty:
+                st.info("No exposure data for this snapshot.")
+                continue
+
+            exposure_row = selected_row.iloc[0]
+            cols = st.columns(4)
+            cols[0].metric("Used positions", f"{int(exposure_row['Used_Num_Positions'])}")
+            cols[1].metric("Dropped positions", f"{int(exposure_row['Dropped_Num_Positions'])}")
+            cols[2].metric(
+                "Actual start",
+                pd.Timestamp(exposure_row["Actual_Lookback_Start"]).strftime("%Y-%m-%d"),
+            )
+            cols[3].metric(
+                "Actual end",
+                pd.Timestamp(exposure_row["Actual_Lookback_End"]).strftime("%Y-%m-%d"),
+            )
+
+            metadata_cols = [
+                "Snapshot_Date",
+                "Effective_Date",
+                "Requested_Lookback_Start",
+                "Requested_Lookback_End",
+                "Actual_Lookback_Start",
+                "Actual_Lookback_End",
+                "Requested_Num_Positions",
+                "Used_Num_Positions",
+                "Dropped_Num_Positions",
+                "Requested_Gross_Long_Weight",
+                "Requested_Gross_Short_Weight",
+                "Used_Gross_Long_Weight",
+                "Used_Gross_Short_Weight",
+                "R_Squared",
+                "Adj_R_Squared",
+                "N_Obs",
+                "Residual_Std_Error",
+            ]
+            st.dataframe(selected_row[metadata_cols], use_container_width=True)
+
+            factor_values = (
+                selected_row.drop(columns=[col for col in metadata_cols if col in selected_row.columns])
+                .transpose()
+                .reset_index()
+            )
+            factor_values.columns = ["Raw_Factor", "Value"]
+            pvalue_rows = factor_values[factor_values["Raw_Factor"].str.startswith("PValue:")].copy()
+            pvalue_rows["Factor"] = pvalue_rows["Raw_Factor"].str.replace("PValue:", "", regex=False)
+            pvalue_rows = pvalue_rows[["Factor", "Value"]].rename(columns={"Value": "P_Value"})
+
+            loading_rows = factor_values[~factor_values["Raw_Factor"].str.startswith("PValue:")].copy()
+            loading_rows = loading_rows.rename(columns={"Raw_Factor": "Factor", "Value": "Exposure"})
+
+            factor_values = loading_rows.merge(pvalue_rows, on="Factor", how="left")
+            factor_values = factor_values.dropna(subset=["Exposure"])
+            st.dataframe(factor_values, use_container_width=True)
+
+
 def _render_output_files() -> None:
     st.subheader("Generated Files")
     output_dir = Path(DataConfig.OUTPUT_DIR)
@@ -333,8 +447,8 @@ def main() -> None:
         st.info("Choose parameters in the sidebar and click Run Backtest.")
         return
 
-    summary_tab, charts_tab, data_tab, outputs_tab = st.tabs(
-        ["Summary", "Charts", "Data", "Outputs"]
+    summary_tab, charts_tab, data_tab, snapshots_tab, outputs_tab = st.tabs(
+        ["Summary", "Charts", "Data", "Snapshots", "Outputs"]
     )
 
     with summary_tab:
@@ -345,6 +459,9 @@ def main() -> None:
 
     with data_tab:
         _render_tables(result)
+
+    with snapshots_tab:
+        _render_snapshots(result)
 
     with outputs_tab:
         _render_output_files()

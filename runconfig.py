@@ -48,6 +48,7 @@ def create_backtests():
         benchmark_tickers=benchmark_tickers,
         factor_list=None,
         factor_lookback_days=None,
+        snapshot_factor_lookback_days=lookback_days,
         factor_data_file=str(DataConfig.FACTOR_FILE),
         summary_file=None,
         parallel=True,

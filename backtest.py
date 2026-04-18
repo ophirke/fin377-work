@@ -21,14 +21,19 @@ from scipy.optimize import minimize
 from tqdm import tqdm
 
 import rossa
-from data import clean_price_data, init_worker_lock
+from data import init_worker_lock, mask_invalid_price_cells
 from datamarshal import (
     DataConfig,
     load_nasdaq100_constituents,
     load_sp100_constituents,
     load_sp500_constituents,
 )
-from factor import compute_factor_loadings, load_factor_data
+from factor import (
+    compute_factor_exposures,
+    compute_factor_loadings,
+    load_factor_data,
+    select_factor_columns,
+)
 
 NUM_WORKERS = max(1, min(12, multiprocessing.cpu_count() - 4))
 
@@ -102,6 +107,7 @@ class BacktestConfig:
     benchmark_tickers: Optional[List[str]] = None
     factor_list: Optional[List[str]] = None
     factor_lookback_days: Optional[int] = None
+    snapshot_factor_lookback_days: Optional[int] = None
     factor_data_file: str = "factor_returns.xlsx"
     summary_file: Optional[str] = None
     parallel: bool = False
@@ -117,6 +123,8 @@ class BacktestResult:
     summary_stats: Dict
     benchmark_data: Optional[Dict[str, pd.DataFrame]] = None
     benchmark_metrics: Optional[Dict[str, Dict]] = None
+    portfolio_snapshots: Optional[pd.DataFrame] = None
+    snapshot_factor_exposures: Optional[Dict[str, pd.DataFrame]] = None
 
     @property
     def total_return(self) -> float:
@@ -272,20 +280,19 @@ def calculate_benchmark_daily_values(
     """
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
+    sanitized_prices = mask_invalid_price_cells(
+        prices[(prices.index >= start) & (prices.index <= end)]
+    ).ffill()
 
     benchmark_data = {}
 
     for ticker in benchmark_tickers:
-        if ticker not in prices.columns:
+        if ticker not in sanitized_prices.columns:
             logger.warning(f"Benchmark ticker {ticker} not found in price data")
             continue
 
         # Get benchmark prices for date range
-        benchmark_prices = (
-            prices[(prices.index >= start) & (prices.index <= end)][[ticker]]
-            .ffill()
-            .copy()
-        )
+        benchmark_prices = sanitized_prices[[ticker]].copy()
 
         benchmark_prices = benchmark_prices.dropna()
 
@@ -928,10 +935,10 @@ def calculate_portfolio_daily_values(
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
 
-    # Fix lookahead bias: Only use ffill(), never bfill()
-    prices_filtered = (
-        prices[(prices.index >= start) & (prices.index <= end)].ffill().copy()
-    )
+    # Apply cell-level sanitization, then carry forward the last valid price.
+    prices_filtered = mask_invalid_price_cells(
+        prices[(prices.index >= start) & (prices.index <= end)]
+    ).ffill()
 
     # CRITICAL FIX: Strip out any duplicate columns before matrix operations
     prices_filtered = prices_filtered.loc[:, ~prices_filtered.columns.duplicated()]
@@ -1173,6 +1180,258 @@ def calculate_portfolio_metrics(
     return portfolio_summary, summary_stats
 
 
+def compute_portfolio_snapshots(
+    daily_holdings: pd.DataFrame,
+    rebalance_schedule: Dict[pd.Timestamp, pd.DataFrame],
+) -> pd.DataFrame:
+    """Build a holdings snapshot for each rebalance event."""
+    if daily_holdings.empty or not rebalance_schedule:
+        return pd.DataFrame()
+
+    available_dates = pd.Index(pd.to_datetime(daily_holdings["Date"]).drop_duplicates().sort_values())
+    snapshot_frames = []
+
+    for rebalance_date, allocation_df in sorted(rebalance_schedule.items()):
+        effective_candidates = available_dates[available_dates >= rebalance_date]
+        if len(effective_candidates) == 0:
+            continue
+
+        effective_date = effective_candidates[0]
+        holdings_slice = daily_holdings[pd.to_datetime(daily_holdings["Date"]) == effective_date].copy()
+        if holdings_slice.empty:
+            continue
+
+        allocation_slice = allocation_df[
+            ["Stock", "Coreness", "Allocation", "Coreness_Rank"]
+        ].copy()
+        snapshot = holdings_slice.merge(
+            allocation_slice,
+            left_on="Ticker",
+            right_on="Stock",
+            how="left",
+        )
+        snapshot.drop(columns=["Stock"], inplace=True)
+        snapshot["Snapshot_Date"] = rebalance_date
+        snapshot["Effective_Date"] = effective_date
+        snapshot["Shares"] = np.where(
+            snapshot["Price"] != 0,
+            snapshot["Position_Value"] / snapshot["Price"],
+            np.nan,
+        )
+        snapshot["Portfolio_Weight"] = np.where(
+            snapshot["Portfolio_Total_Value"] != 0,
+            snapshot["Position_Value"] / snapshot["Portfolio_Total_Value"],
+            np.nan,
+        )
+        snapshot["Action"] = np.where(snapshot["Position_Value"] < 0, "SHORT", "LONG")
+        snapshot_frames.append(snapshot)
+
+    if not snapshot_frames:
+        return pd.DataFrame()
+
+    snapshots_df = pd.concat(snapshot_frames, ignore_index=True)
+    snapshots_df = snapshots_df[
+        [
+            "Snapshot_Date",
+            "Effective_Date",
+            "Ticker",
+            "Action",
+            "Coreness",
+            "Coreness_Rank",
+            "Allocation",
+            "Portfolio_Weight",
+            "Shares",
+            "Price",
+            "Position_Value",
+            "Portfolio_Total_Value",
+        ]
+    ]
+    snapshots_df = snapshots_df.sort_values(
+        ["Snapshot_Date", "Action", "Coreness_Rank", "Ticker"]
+    ).reset_index(drop=True)
+    return snapshots_df
+
+
+def _renormalize_snapshot_weights(
+    weights: pd.Series,
+    target_long: Optional[float] = None,
+    target_short: Optional[float] = None,
+) -> pd.Series:
+    """Preserve target long and short gross exposures after dropping tickers."""
+    weights = weights.astype(float).copy()
+    positive = weights[weights > 0]
+    negative = weights[weights < 0]
+    target_long = positive.sum() if target_long is None else float(target_long)
+    target_short = -negative.sum() if target_short is None else float(target_short)
+
+    if target_long > 0 and positive.sum() > 0:
+        positive = positive / positive.sum() * target_long
+    if target_short > 0 and (-negative.sum()) > 0:
+        negative = negative / (-negative.sum()) * target_short
+
+    normalized = pd.concat([positive, negative]).reindex(weights.index).fillna(0.0)
+    return normalized
+
+
+def _compute_snapshot_portfolio_returns(
+    snapshot_df: pd.DataFrame,
+    price_data: pd.DataFrame,
+    lookback_days: int,
+) -> Tuple[pd.Series, Dict[str, object]]:
+    """Compute static-weights portfolio returns and sample metadata for a snapshot."""
+    snapshot_date = pd.Timestamp(snapshot_df["Snapshot_Date"].iloc[0])
+    requested_lookback_end = snapshot_date - pd.Timedelta(days=1)
+    requested_lookback_start = snapshot_date - pd.Timedelta(days=lookback_days)
+
+    weights = snapshot_df.set_index("Ticker")["Portfolio_Weight"].dropna()
+    if weights.empty:
+        raise ValueError("Snapshot has no valid portfolio weights")
+
+    original_long_gross = float(weights[weights > 0].sum())
+    original_short_gross = float(-weights[weights < 0].sum())
+
+    price_window = price_data[
+        (price_data.index >= requested_lookback_start)
+        & (price_data.index <= requested_lookback_end)
+    ][list(weights.index)].copy()
+    price_window = mask_invalid_price_cells(price_window).ffill()
+    if price_window.empty:
+        raise ValueError("No price data available for snapshot lookback window")
+
+    min_required = max(2, int(0.8 * len(price_window)))
+    price_window = price_window.dropna(axis=1, thresh=min_required)
+    price_window = price_window.dropna()
+    valid_tickers = price_window.columns.intersection(weights.index)
+    if len(valid_tickers) == 0:
+        raise ValueError("No snapshot tickers have sufficient price history")
+
+    weights = _renormalize_snapshot_weights(
+        weights.loc[valid_tickers],
+        target_long=original_long_gross,
+        target_short=original_short_gross,
+    )
+    asset_returns = price_window[valid_tickers].pct_change().dropna()
+    if len(asset_returns) < 10:
+        raise ValueError(
+            f"Insufficient return history for snapshot exposure calculation: {len(asset_returns)}"
+        )
+
+    portfolio_returns = asset_returns.mul(weights, axis=1).sum(axis=1)
+    sample_metadata = {
+        "Requested_Lookback_Start": requested_lookback_start,
+        "Requested_Lookback_End": requested_lookback_end,
+        "Actual_Lookback_Start": asset_returns.index.min(),
+        "Actual_Lookback_End": asset_returns.index.max(),
+        "Requested_Num_Positions": int(snapshot_df["Ticker"].nunique()),
+        "Used_Num_Positions": int(len(valid_tickers)),
+        "Dropped_Num_Positions": int(snapshot_df["Ticker"].nunique() - len(valid_tickers)),
+        "Requested_Gross_Long_Weight": original_long_gross,
+        "Requested_Gross_Short_Weight": original_short_gross,
+        "Used_Gross_Long_Weight": float(weights[weights > 0].sum()),
+        "Used_Gross_Short_Weight": float(-weights[weights < 0].sum()),
+    }
+    return portfolio_returns, sample_metadata
+
+
+def compute_snapshot_factor_exposures(
+    portfolio_snapshots: pd.DataFrame,
+    price_data: pd.DataFrame,
+    factor_data_file: str,
+    lookback_days: int,
+) -> Dict[str, pd.DataFrame]:
+    """Compute factor exposures for each rebalance snapshot across three factor sets."""
+    if portfolio_snapshots.empty:
+        return {}
+
+    factor_returns = load_factor_data(factor_data_file, sheet_name=0)
+    factor_sets = {
+        "market_general": select_factor_columns(
+            factor_returns,
+            include_market=True,
+            include_general=True,
+            include_sectors=False,
+            include_industries=False,
+        ),
+        "market_general_sectors": select_factor_columns(
+            factor_returns,
+            include_market=True,
+            include_general=True,
+            include_sectors=True,
+            include_industries=False,
+        ),
+        "market_general_sectors_industries": select_factor_columns(
+            factor_returns,
+            include_market=True,
+            include_general=True,
+            include_sectors=True,
+            include_industries=True,
+        ),
+    }
+
+    exposures_by_set: Dict[str, List[Dict]] = {name: [] for name in factor_sets}
+
+    for snapshot_date, snapshot_df in portfolio_snapshots.groupby("Snapshot_Date"):
+        try:
+            portfolio_returns, sample_metadata = _compute_snapshot_portfolio_returns(
+                snapshot_df, price_data, lookback_days
+            )
+        except Exception as exc:
+            logger.warning(f"Snapshot {pd.Timestamp(snapshot_date).date()}: exposure calc skipped ({exc})")
+            continue
+
+        base_record = {
+            "Snapshot_Date": pd.Timestamp(snapshot_date),
+            "Effective_Date": pd.Timestamp(snapshot_df["Effective_Date"].iloc[0]),
+        }
+        base_record.update(sample_metadata)
+
+        for factor_set_name, selected_factors in factor_sets.items():
+            if not selected_factors:
+                continue
+
+            try:
+                exposures_df, diagnostics = compute_factor_exposures(
+                    portfolio_returns=portfolio_returns,
+                    factor_returns=factor_returns,
+                    factors=selected_factors,
+                    market_factor="Market",
+                    min_factor_coverage=0.7,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Snapshot {pd.Timestamp(snapshot_date).date()} {factor_set_name}: exposure calc failed ({exc})"
+                )
+                continue
+
+            record = dict(base_record)
+            record.update(
+                {
+                    "R_Squared": diagnostics["r_squared"],
+                    "Adj_R_Squared": diagnostics["adj_r_squared"],
+                    "N_Obs": diagnostics["n_obs"],
+                    "Residual_Std_Error": diagnostics["residual_std_error"],
+                    "Actual_Lookback_Start": diagnostics["sample_start"],
+                    "Actual_Lookback_End": diagnostics["sample_end"],
+                }
+            )
+            coefficient_loadings = diagnostics.get("coefficient_loadings", {})
+            coefficient_pvalues = diagnostics.get("coefficient_pvalues", {})
+            record["Intercept"] = coefficient_loadings.get("Intercept", np.nan)
+            record["PValue:Intercept"] = coefficient_pvalues.get("Intercept", np.nan)
+            exposure_map = dict(zip(exposures_df["Factor"], exposures_df["Loading"]))
+            pvalue_map = dict(zip(exposures_df["Factor"], exposures_df["p_value"]))
+            for factor_name in selected_factors:
+                record[factor_name] = exposure_map.get(factor_name, np.nan)
+                record[f"PValue:{factor_name}"] = pvalue_map.get(factor_name, np.nan)
+            exposures_by_set[factor_set_name].append(record)
+
+    return {
+        factor_set_name: pd.DataFrame(records).sort_values("Snapshot_Date").reset_index(drop=True)
+        for factor_set_name, records in exposures_by_set.items()
+        if records
+    }
+
+
 def export_benchmark_data_to_excel(
     benchmark_data: Dict[str, pd.DataFrame],
     benchmark_metrics: Dict[str, Dict],
@@ -1305,6 +1564,8 @@ def _write_backtest_sheets(
     summary_stats: Dict,
     benchmark_data: Optional[Dict[str, pd.DataFrame]],
     benchmark_metrics: Optional[Dict[str, Dict]],
+    portfolio_snapshots: Optional[pd.DataFrame],
+    snapshot_factor_exposures: Optional[Dict[str, pd.DataFrame]],
     export_config: ExcelExportConfig,
 ) -> None:
     """Write all backtest result sheets into an open Excel workbook."""
@@ -1394,6 +1655,30 @@ def _write_backtest_sheets(
         writer, rebalance_df, sheet_name="Rebalance Events", index=False
     )
 
+    if portfolio_snapshots is not None and not portfolio_snapshots.empty:
+        _write_dataframe_sheet(
+            writer,
+            portfolio_snapshots,
+            sheet_name="Portfolio Snapshots",
+            index=False,
+        )
+
+    if snapshot_factor_exposures:
+        sheet_names = {
+            "market_general": "Exposure_Mkt_General",
+            "market_general_sectors": "Exposure_With_Sectors",
+            "market_general_sectors_industries": "Exposure_With_Industries",
+        }
+        for factor_set_name, exposure_df in snapshot_factor_exposures.items():
+            if exposure_df is None or exposure_df.empty:
+                continue
+            _write_dataframe_sheet(
+                writer,
+                exposure_df,
+                sheet_name=sheet_names.get(factor_set_name, factor_set_name[:31]),
+                index=False,
+            )
+
     _write_benchmark_sheets(writer, benchmark_data, benchmark_metrics, export_config)
 
 
@@ -1404,6 +1689,8 @@ def export_to_excel(
     summary_stats: Dict,
     benchmark_data: Optional[Dict[str, pd.DataFrame]] = None,
     benchmark_metrics: Optional[Dict[str, Dict]] = None,
+    portfolio_snapshots: Optional[pd.DataFrame] = None,
+    snapshot_factor_exposures: Optional[Dict[str, pd.DataFrame]] = None,
     output_filename: str = "backtest_results.xlsx",
     export_config: Optional[ExcelExportConfig] = None,
 ) -> None:
@@ -1426,6 +1713,8 @@ def export_to_excel(
         summary_stats: Dict with performance metrics from calculate_portfolio_metrics
         benchmark_data: Optional benchmark daily data to write in the same workbook
         benchmark_metrics: Optional benchmark summary stats to write in the same workbook
+        portfolio_snapshots: Optional snapshot holdings table
+        snapshot_factor_exposures: Optional snapshot exposure tables
         output_filename: Output Excel filename
         export_config: Lossless Excel writer settings
     """
@@ -1464,6 +1753,8 @@ def export_to_excel(
                 summary_stats,
                 benchmark_data,
                 benchmark_metrics,
+                portfolio_snapshots,
+                snapshot_factor_exposures,
                 export_config,
             )
     except ModuleNotFoundError:
@@ -1479,6 +1770,8 @@ def export_to_excel(
                 summary_stats,
                 benchmark_data,
                 benchmark_metrics,
+                portfolio_snapshots,
+                snapshot_factor_exposures,
                 export_config,
             )
 
@@ -1811,7 +2104,7 @@ def compute_factor_loadings_over_time(
     factor_lookback_days: int,
     factor_list: Optional[List[str]] = None,
     factor_data_file: str = "factor_returns.xlsx",
-) -> Tuple[pd.DataFrame, pd.Series]:
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.Series]]:
     """
     Compute factor loadings at each rebalance date using a rolling lookback window.
 
@@ -1843,10 +2136,11 @@ def compute_factor_loadings_over_time(
     except FileNotFoundError:
         logger.warning(f"Factor data file not found: {factor_data_file}")
         logger.warning("Skipping factor analysis.")
-        return None, None
+        return None, None, None
 
     # Store loadings and R² for each rebalance
     loadings_records = []
+    pvalue_records = []
     rsquared_values = []
     rebalance_dates_list = []
 
@@ -1890,6 +2184,11 @@ def compute_factor_loadings_over_time(
             loading_dict = dict(zip(loadings_df["Factor"], loadings_df["Loading"]))
             loading_dict["Rebalance_Date"] = rebalance_date
             loadings_records.append(loading_dict)
+
+            pvalue_dict = diagnostics.get("coefficient_pvalues", {}).copy()
+            pvalue_dict["Rebalance_Date"] = rebalance_date
+            pvalue_records.append(pvalue_dict)
+
             rsquared_values.append(diagnostics["r_squared"])
             rebalance_dates_list.append(rebalance_date)
 
@@ -1903,15 +2202,24 @@ def compute_factor_loadings_over_time(
 
     if not loadings_records:
         logger.warning("No factor loadings computed. Skipping factor analysis.")
-        return None, None
+        return None, None, None
 
     # Convert to DataFrames (keep NaN for non-significant factors in each window)
     # Do NOT fillna(0) — NaN represents "not significant in this window", not zero loading
     factor_loadings_df = pd.DataFrame(loadings_records)
+    factor_pvalues_df = pd.DataFrame(pvalue_records)
 
     # Filter to factors that appeared in at least 10% of windows (meaningful signal)
     min_appearances = int(0.1 * len(factor_loadings_df))
     factor_loadings_df = factor_loadings_df.dropna(axis=1, thresh=min_appearances)
+    retained_columns = ["Rebalance_Date"]
+    retained_columns.extend(
+        col for col in factor_loadings_df.columns if col != "Rebalance_Date"
+    )
+    for required_col in ["Intercept", "Market"]:
+        if required_col in factor_pvalues_df.columns and required_col not in retained_columns:
+            retained_columns.append(required_col)
+    factor_pvalues_df = factor_pvalues_df.reindex(columns=retained_columns)
 
     rsquared_series = pd.Series(rsquared_values, index=rebalance_dates_list)
 
@@ -1922,7 +2230,7 @@ def compute_factor_loadings_over_time(
         f"Factors with ≥10% appearance frequency: {len(factor_loadings_df.columns) - 1}"
     )  # -1 for Rebalance_Date
 
-    return factor_loadings_df, rsquared_series
+    return factor_loadings_df, factor_pvalues_df, rsquared_series
 
 
 def plot_factor_loadings_multiline(
@@ -2071,6 +2379,7 @@ def plot_factor_rsquared(
 
 def export_factor_analysis_to_excel(
     factor_loadings_df: pd.DataFrame,
+    factor_pvalues_df: Optional[pd.DataFrame],
     rsquared_series: pd.Series,
     output_filename: str = "factor_analysis.xlsx",
 ) -> None:
@@ -2079,6 +2388,7 @@ def export_factor_analysis_to_excel(
 
     Args:
         factor_loadings_df: DataFrame from compute_factor_loadings_over_time
+        factor_pvalues_df: P-value DataFrame from compute_factor_loadings_over_time
         rsquared_series: Series from compute_factor_loadings_over_time
         output_filename: Output Excel filename
     """
@@ -2094,6 +2404,14 @@ def export_factor_analysis_to_excel(
         loadings_export.to_excel(writer, sheet_name="Factor Loadings", index=False)
 
         # Sheet 2: R² Values
+        if factor_pvalues_df is not None:
+            pvalues_export = factor_pvalues_df.copy()
+            if "Rebalance_Date" in pvalues_export.columns:
+                pvalues_export["Rebalance_Date"] = pvalues_export[
+                    "Rebalance_Date"
+                ].dt.strftime("%Y-%m-%d")
+            pvalues_export.to_excel(writer, sheet_name="Factor P-Values", index=False)
+
         rsq_export = pd.DataFrame(
             {
                 "Rebalance_Date": rsquared_series.index.strftime("%Y-%m-%d"),
@@ -2103,6 +2421,36 @@ def export_factor_analysis_to_excel(
         rsq_export.to_excel(writer, sheet_name="R_Squared", index=False)
 
     logger.info(f"Factor analysis exported: {output_filename}")
+
+
+def export_snapshot_analysis_files(
+    portfolio_snapshots: Optional[pd.DataFrame],
+    snapshot_factor_exposures: Optional[Dict[str, pd.DataFrame]],
+    output_dir: str,
+) -> None:
+    """Export snapshot holdings and exposure tables to standalone CSV files."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    if portfolio_snapshots is not None and not portfolio_snapshots.empty:
+        portfolio_snapshots.to_csv(
+            os.path.join(output_dir, "portfolio_snapshots.csv"), index=False
+        )
+
+    if not snapshot_factor_exposures:
+        return
+
+    filename_map = {
+        "market_general": "snapshot_exposures_market_general.csv",
+        "market_general_sectors": "snapshot_exposures_with_sectors.csv",
+        "market_general_sectors_industries": "snapshot_exposures_with_industries.csv",
+    }
+    for factor_set_name, exposure_df in snapshot_factor_exposures.items():
+        if exposure_df is None or exposure_df.empty:
+            continue
+        exposure_df.to_csv(
+            os.path.join(output_dir, filename_map.get(factor_set_name, f"{factor_set_name}.csv")),
+            index=False,
+        )
 
 
 def run_backtest(config: BacktestConfig) -> BacktestResult:
@@ -2164,9 +2512,6 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
 
     price_data = rossa.fetch_and_cache_stock_data(tuple(tickers_to_fetch))
 
-    # CRITICAL FIX: Clean price data (remove penny stocks & data glitches)
-    price_data = clean_price_data(price_data, min_price=1.0, max_price=10000.0)
-
     # Verify data covers the required backtest period
     actual_start = price_data.index[0]
     actual_end = price_data.index[-1]
@@ -2198,6 +2543,28 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
     logger.info("[5/6] Calculating portfolio metrics...")
     portfolio_summary, summary_stats = calculate_portfolio_metrics(daily_holdings)
 
+    # Build portfolio snapshots and factor exposures at each rebalance
+    portfolio_snapshots = compute_portfolio_snapshots(daily_holdings, rebalance_schedule)
+    snapshot_factor_exposures = {}
+    snapshot_factor_lookback_days = (
+        config.snapshot_factor_lookback_days
+        or config.factor_lookback_days
+        or config.lookback_days
+    )
+    try:
+        snapshot_factor_exposures = compute_snapshot_factor_exposures(
+            portfolio_snapshots=portfolio_snapshots,
+            price_data=price_data,
+            factor_data_file=config.factor_data_file,
+            lookback_days=snapshot_factor_lookback_days,
+        )
+    except FileNotFoundError:
+        logger.warning(
+            f"Factor data file not found for snapshot exposures: {config.factor_data_file}"
+        )
+    except Exception as exc:
+        logger.warning(f"Snapshot factor exposure computation failed: {exc}")
+
     # Fetch benchmark data if requested
     benchmark_data = None
     benchmark_metrics = None
@@ -2228,6 +2595,8 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
             summary_stats,
             benchmark_data,
             benchmark_metrics,
+            portfolio_snapshots,
+            snapshot_factor_exposures,
             output_excel_path,
             config.excel_export,
         )
@@ -2240,6 +2609,13 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
         )
         export_summary_txt(
             summary_stats, portfolio_summary, benchmark_metrics, summary_file_path
+        )
+
+    if portfolio_snapshots is not None and not portfolio_snapshots.empty:
+        export_snapshot_analysis_files(
+            portfolio_snapshots,
+            snapshot_factor_exposures,
+            output_dir=str(DataConfig.OUTPUT_DIR),
         )
 
     # Generate plots (with benchmarks if available)
@@ -2266,11 +2642,12 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
 
     # Step 6: Factor analysis (if requested)
     factor_loadings_df = None
+    factor_pvalues_df = None
     rsquared_series = None
 
     if config.factor_lookback_days is not None and config.factor_lookback_days > 0:
         logger.info("[6/6] Computing factor analysis...")
-        factor_loadings_df, rsquared_series = compute_factor_loadings_over_time(
+        factor_loadings_df, factor_pvalues_df, rsquared_series = compute_factor_loadings_over_time(
             portfolio_summary=portfolio_summary,
             rebalance_dates=rebalance_dates,
             factor_lookback_days=config.factor_lookback_days,
@@ -2298,6 +2675,7 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
             )
             export_factor_analysis_to_excel(
                 factor_loadings_df,
+                factor_pvalues_df,
                 rsquared_series,
                 os.path.join(str(DataConfig.OUTPUT_DIR), "factor_analysis.xlsx"),
             )
@@ -2325,6 +2703,8 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
         summary_stats=summary_stats,
         benchmark_data=benchmark_data,
         benchmark_metrics=benchmark_metrics,
+        portfolio_snapshots=portfolio_snapshots,
+        snapshot_factor_exposures=snapshot_factor_exposures,
     )
 
 
