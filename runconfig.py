@@ -7,14 +7,11 @@ import pandas as pd
 from backtest import (
     BacktestConfig,
     SingleBacktestRun,
+    StrategyConfig,
     StepForwardBacktestRun,
     load_tickers_from_file,
 )
 from datamarshal import DataConfig, load_nasdaq100_constituents, load_sp100_constituents, load_sp500_constituents
-
-
-RUN_SINGLE_BACKTEST = True
-RUN_STEP_FORWARD_EVAL = False
 
 
 def create_backtests():
@@ -23,6 +20,16 @@ def create_backtests():
     rebalance_interval_days = 30
     factor_lookback_days = 365 * 3
     benchmark_tickers = ["SPY", "IWM"]
+    
+    strategy = StrategyConfig(
+        target_net_exposure=1.0,
+        short_amount=0.5,
+        periphery_threshold_quantile=0.05,
+        long_periphery=True,
+        weighting_method="equal",
+        max_long_weight=1.90,
+        max_short_weight=0.90,
+    )
 
     # Pick the universe you want to use.
     # ticker_source = load_sp100_constituents
@@ -44,42 +51,42 @@ def create_backtests():
         factor_data_file=str(DataConfig.FACTOR_FILE),
         summary_file=None,
         parallel=True,
+        strategy=strategy,
     )
 
     plans = []
 
-    if RUN_SINGLE_BACKTEST:
-        plans.append(
-            SingleBacktestRun(
-                name="sp500_full_backtest",
-                config=replace(
-                    base_config,
-                    output_plots=True,
-                    summary_file="backtest_summary.txt",
-                    factor_lookback_days=factor_lookback_days,
-                ),
-            )
+    plans.append(
+        SingleBacktestRun(
+            name="sp500_full_backtest",
+            config=replace(
+                base_config,
+                output_excel="backtest_results.xlsx",
+                output_plots=True,
+                summary_file="backtest_summary.txt",
+                factor_lookback_days=factor_lookback_days,
+            ),
         )
+    )
 
-    if RUN_STEP_FORWARD_EVAL:
-        plans.append(
-            StepForwardBacktestRun(
-                name="sp500_step_forward",
-                base_config=replace(
-                    base_config,
-                    output_plots=False,
-                    output_excel=None,
-                    summary_file=None,
-                    factor_lookback_days=None,
-                ),
-                overall_start_date="2008-04-13",
-                overall_end_date="2026-04-13",
-                eval_lookback=pd.DateOffset(years=1),
-                eval_interval=pd.DateOffset(months=1),
-                summary_plot_filename="summary_over_time.png",
-                parallel=True,
-            )
-        )
+    # plans.append(
+    #     StepForwardBacktestRun(
+    #         name="sp500_step_forward",
+    #         base_config=replace(
+    #             base_config,
+    #             output_plots=False,
+    #             output_excel=None,
+    #             summary_file=None,
+    #             factor_lookback_days=None,
+    #         ),
+    #         overall_start_date="2008-04-13",
+    #         overall_end_date="2026-04-13",
+    #         eval_lookback=pd.DateOffset(years=1),
+    #         eval_interval=pd.DateOffset(months=1),
+    #         summary_plot_filename="summary_over_time.png",
+    #         parallel=True,
+    #     )
+    # )
 
     return plans
 

@@ -9,7 +9,7 @@ core stocks. Tracks daily portfolio values and outputs results to Excel with vis
 import logging
 import multiprocessing
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from multiprocessing import Pool
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -30,21 +30,62 @@ from datamarshal import (
 )
 from factor import compute_factor_loadings, load_factor_data
 
-SHORT_AMOUNT = 0.90
-PERIPHERY_THRESHOLD_QUANTILE = 0.05
-LONG_PERIPHERY = True
-WEIGHTING_METHOD = "equal"  # Options: "equal", "markowitz_min_vol"
-MAX_LONG_WEIGHT = 1.0 + SHORT_AMOUNT
-MAX_SHORT_WEIGHT = SHORT_AMOUNT
-
-if not LONG_PERIPHERY:
-    PERIPHERY_THRESHOLD_QUANTILE = 1 - PERIPHERY_THRESHOLD_QUANTILE
-
 NUM_WORKERS = max(1, min(12, multiprocessing.cpu_count() - 4))
 
 # ============================================================================
 # BACKTEST CONFIGURATION
 # ============================================================================
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    """Strategy-specific portfolio construction settings."""
+
+    target_net_exposure: float = 1.0
+    short_amount: float = 0.90
+    periphery_threshold_quantile: float = 0.05
+    long_periphery: bool = True
+    weighting_method: str = "equal"  # Options: "equal", "coreness_proportional", "markowitz_min_vol"
+    max_long_weight: Optional[float] = None
+    max_short_weight: Optional[float] = None
+
+    @property
+    def effective_periphery_quantile(self) -> float:
+        """Return the quantile used to split coreness into portfolio sides."""
+        if self.long_periphery:
+            return self.periphery_threshold_quantile
+        return 1.0 - self.periphery_threshold_quantile
+
+    @property
+    def gross_long_exposure(self) -> float:
+        """Total positive exposure target."""
+        return self.target_net_exposure + self.short_amount
+
+    @property
+    def gross_short_exposure(self) -> float:
+        """Total absolute short exposure target."""
+        return self.short_amount
+
+    @property
+    def resolved_max_long_weight(self) -> float:
+        """Per-name cap for long positions."""
+        if self.max_long_weight is not None:
+            return self.max_long_weight
+        return self.gross_long_exposure
+
+    @property
+    def resolved_max_short_weight(self) -> float:
+        """Per-name cap for short positions."""
+        if self.max_short_weight is not None:
+            return self.max_short_weight
+        return self.gross_short_exposure
+
+
+@dataclass(frozen=True)
+class ExcelExportConfig:
+    """Controls lossless Excel writer behavior."""
+
+    use_constant_memory: bool = True
 
 
 @dataclass
@@ -64,6 +105,8 @@ class BacktestConfig:
     factor_data_file: str = "factor_returns.xlsx"
     summary_file: Optional[str] = None
     parallel: bool = False
+    strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    excel_export: ExcelExportConfig = field(default_factory=ExcelExportConfig)
 
 
 @dataclass
@@ -388,7 +431,7 @@ def _compute_allocation_for_rebalance_date(
     Returns:
         Tuple of (rebalance_date, allocations_df)
     """
-    rebalance_date, ticker_list, lookback_days = args
+    rebalance_date, ticker_list, lookback_days, strategy = args
 
     # Get tickers for this rebalance date (dynamic or static)
     if callable(ticker_list):
@@ -414,7 +457,9 @@ def _compute_allocation_for_rebalance_date(
     results = rossa.rossa_core_periphery(A, ticker_names)
 
     # Get allocations based on coreness
-    allocations = allocate_by_coreness(results, log_returns=log_returns)
+    allocations = allocate_by_coreness(
+        results, strategy_config=strategy, log_returns=log_returns
+    )
 
     # Add rebalance metadata
     allocations["RebalanceDate"] = rebalance_date
@@ -425,7 +470,10 @@ def _compute_allocation_for_rebalance_date(
     return rebalance_date, allocations
 
 
-def _allocate_by_coreness_equal_legacy(results_df: pd.DataFrame) -> pd.DataFrame:
+def _allocate_by_coreness_equal_legacy(
+    results_df: pd.DataFrame,
+    strategy_config: Optional[StrategyConfig] = None,
+) -> pd.DataFrame:
     """
     Maps coreness scores to portfolio allocations.
 
@@ -448,7 +496,8 @@ def _allocate_by_coreness_equal_legacy(results_df: pd.DataFrame) -> pd.DataFrame
     """
 
     # Use 20th percentile as threshold: stocks in lowest 20% are PERIPHERAL
-    quantile_prop = PERIPHERY_THRESHOLD_QUANTILE
+    strategy = strategy_config or StrategyConfig()
+    quantile_prop = strategy.effective_periphery_quantile
     coreness_threshold = results_df["Coreness"].quantile(quantile_prop)
 
     # Count how many core and peripheral stocks
@@ -462,20 +511,15 @@ def _allocate_by_coreness_equal_legacy(results_df: pd.DataFrame) -> pd.DataFrame
     allocations = []
 
     for _, row in results_df.iterrows():
-        core_alloc = -SHORT_AMOUNT
+        core_alloc = -strategy.short_amount
         periphery_alloc = 1.0 - core_alloc
-        if not LONG_PERIPHERY:
+        if not strategy.long_periphery:
             core_alloc, periphery_alloc = periphery_alloc, core_alloc
         core_alloc = core_alloc / n_core if n_core > 0 else 0.0
         periphery_alloc = periphery_alloc / n_peripheral if n_peripheral > 0 else 0.0
         allocation = (
             core_alloc if row["Coreness"] >= coreness_threshold else periphery_alloc
         )
-
-        # if (row["Coreness"] >= coreness_threshold):
-        #     allocation = -SHORT_AMOUNT / n_core if n_core > 0 else 0.0
-        # else:
-        #     allocation = (1.0 + SHORT_AMOUNT) / n_peripheral if n_peripheral > 0 else 0.0
 
         allocations.append(
             {
@@ -500,20 +544,21 @@ def _allocate_by_coreness_equal_legacy(results_df: pd.DataFrame) -> pd.DataFrame
     return allocations_df
 
 
-def _get_side_exposures() -> Tuple[float, float]:
+def _get_side_exposures(strategy_config: StrategyConfig) -> Tuple[float, float]:
     """Return target gross exposures for the long and short books."""
-    return 1.0 + SHORT_AMOUNT, SHORT_AMOUNT
+    return strategy_config.gross_long_exposure, strategy_config.gross_short_exposure
 
 
 def _classify_coreness_buckets(
     results_df: pd.DataFrame,
+    strategy_config: StrategyConfig,
 ) -> Tuple[pd.DataFrame, pd.Series, pd.Series, float]:
     """Split stocks into long and short books based on coreness."""
-    quantile_prop = PERIPHERY_THRESHOLD_QUANTILE
+    quantile_prop = strategy_config.effective_periphery_quantile
     coreness_threshold = results_df["Coreness"].quantile(quantile_prop)
     is_core = results_df["Coreness"] >= coreness_threshold
 
-    if LONG_PERIPHERY:
+    if strategy_config.long_periphery:
         is_long = ~is_core
         is_short = is_core
     else:
@@ -523,24 +568,30 @@ def _classify_coreness_buckets(
     return results_df.copy(), is_long, is_short, coreness_threshold
 
 
-def _validate_weight_caps(n_long: int, n_short: int) -> None:
+def _validate_weight_caps(
+    n_long: int,
+    n_short: int,
+    strategy_config: StrategyConfig,
+) -> None:
     """Ensure the configured per-stock caps can satisfy target exposures."""
-    long_total, short_total = _get_side_exposures()
+    long_total, short_total = _get_side_exposures(strategy_config)
+    max_long_weight = strategy_config.resolved_max_long_weight
+    max_short_weight = strategy_config.resolved_max_short_weight
 
     if n_long <= 0 or n_short <= 0:
         raise ValueError(
             f"Need at least one long and one short stock, got {n_long} longs and {n_short} shorts"
         )
 
-    if MAX_LONG_WEIGHT * n_long + 1e-12 < long_total:
+    if max_long_weight * n_long + 1e-12 < long_total:
         raise ValueError(
-            f"MAX_LONG_WEIGHT={MAX_LONG_WEIGHT:.4f} is too small for {n_long} long stocks; "
+            f"max_long_weight={max_long_weight:.4f} is too small for {n_long} long stocks; "
             f"need at least {long_total / n_long:.4f} per long to satisfy target exposure"
         )
 
-    if MAX_SHORT_WEIGHT * n_short + 1e-12 < short_total:
+    if max_short_weight * n_short + 1e-12 < short_total:
         raise ValueError(
-            f"MAX_SHORT_WEIGHT={MAX_SHORT_WEIGHT:.4f} is too small for {n_short} short stocks; "
+            f"max_short_weight={max_short_weight:.4f} is too small for {n_short} short stocks; "
             f"need at least {short_total / n_short:.4f} per short to satisfy target exposure"
         )
 
@@ -549,23 +600,26 @@ def _allocate_equal_weights(
     results_df: pd.DataFrame,
     is_long: pd.Series,
     is_short: pd.Series,
+    strategy_config: StrategyConfig,
 ) -> pd.DataFrame:
     """Allocate equal weights within the long and short books."""
     n_long = int(is_long.sum())
     n_short = int(is_short.sum())
-    _validate_weight_caps(n_long, n_short)
+    _validate_weight_caps(n_long, n_short, strategy_config)
 
-    long_total, short_total = _get_side_exposures()
+    long_total, short_total = _get_side_exposures(strategy_config)
     long_weight = long_total / n_long
     short_weight = -short_total / n_short
+    max_long_weight = strategy_config.resolved_max_long_weight
+    max_short_weight = strategy_config.resolved_max_short_weight
 
-    if long_weight > MAX_LONG_WEIGHT + 1e-12:
+    if long_weight > max_long_weight + 1e-12:
         raise ValueError(
-            f"Equal long weight {long_weight:.4f} exceeds MAX_LONG_WEIGHT={MAX_LONG_WEIGHT:.4f}"
+            f"Equal long weight {long_weight:.4f} exceeds max_long_weight={max_long_weight:.4f}"
         )
-    if abs(short_weight) > MAX_SHORT_WEIGHT + 1e-12:
+    if abs(short_weight) > max_short_weight + 1e-12:
         raise ValueError(
-            f"Equal short weight {abs(short_weight):.4f} exceeds MAX_SHORT_WEIGHT={MAX_SHORT_WEIGHT:.4f}"
+            f"Equal short weight {abs(short_weight):.4f} exceeds max_short_weight={max_short_weight:.4f}"
         )
 
     allocations_df = results_df.copy()
@@ -578,15 +632,18 @@ def _allocate_markowitz_min_vol(
     is_long: pd.Series,
     is_short: pd.Series,
     log_returns: pd.DataFrame,
+    strategy_config: StrategyConfig,
 ) -> pd.DataFrame:
     """Minimize portfolio variance subject to long/short exposure and cap constraints."""
     long_tickers = results_df.loc[is_long, "Stock"].tolist()
     short_tickers = results_df.loc[is_short, "Stock"].tolist()
     n_long = len(long_tickers)
     n_short = len(short_tickers)
-    _validate_weight_caps(n_long, n_short)
+    _validate_weight_caps(n_long, n_short, strategy_config)
 
-    long_total, short_total = _get_side_exposures()
+    long_total, short_total = _get_side_exposures(strategy_config)
+    max_long_weight = strategy_config.resolved_max_long_weight
+    max_short_weight = strategy_config.resolved_max_short_weight
     ordered_tickers = long_tickers + short_tickers
     returns_subset = log_returns[ordered_tickers].dropna(how="any")
     if len(returns_subset) < 2:
@@ -606,7 +663,7 @@ def _allocate_markowitz_min_vol(
         {"type": "eq", "fun": lambda x: np.sum(x[:n_long]) - long_total},
         {"type": "eq", "fun": lambda x: np.sum(x[n_long:]) - short_total},
     ]
-    bounds = [(0.0, MAX_LONG_WEIGHT)] * n_long + [(0.0, MAX_SHORT_WEIGHT)] * n_short
+    bounds = [(0.0, max_long_weight)] * n_long + [(0.0, max_short_weight)] * n_short
     x0 = np.array(
         [long_total / n_long] * n_long + [short_total / n_short] * n_short,
         dtype=float,
@@ -633,6 +690,7 @@ def _allocate_markowitz_min_vol(
 
 def allocate_by_coreness(
     results_df: pd.DataFrame,
+    strategy_config: StrategyConfig,
     log_returns: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
@@ -652,31 +710,33 @@ def allocate_by_coreness(
         DataFrame with columns ['Stock', 'Coreness', 'Allocation', 'Coreness_Rank']
     """
     allocations_df, is_long, is_short, coreness_threshold = _classify_coreness_buckets(
-        results_df
+        results_df, strategy_config
     )
     n_long = int(is_long.sum())
     n_short = int(is_short.sum())
     logger.info(
-        f"  -> {n_long} long stocks, {n_short} short stocks using {WEIGHTING_METHOD} "
+        f"  -> {n_long} long stocks, {n_short} short stocks using {strategy_config.weighting_method} "
         f"weighting at coreness threshold {coreness_threshold:.4f}"
     )
 
-    if WEIGHTING_METHOD == "equal":
-        allocations_df = _allocate_equal_weights(allocations_df, is_long, is_short)
-    elif WEIGHTING_METHOD == "markowitz_min_vol":
+    if strategy_config.weighting_method == "equal":
+        allocations_df = _allocate_equal_weights(
+            allocations_df, is_long, is_short, strategy_config
+        )
+    elif strategy_config.weighting_method == "markowitz_min_vol":
         if log_returns is None:
             raise ValueError("log_returns are required for Markowitz weighting")
         allocations_df = _allocate_markowitz_min_vol(
-            allocations_df, is_long, is_short, log_returns
+            allocations_df, is_long, is_short, log_returns, strategy_config
         )
     else:
         raise ValueError(
-            f"Unknown WEIGHTING_METHOD={WEIGHTING_METHOD!r}; expected 'equal' or 'markowitz_min_vol'"
+            f"Unknown weighting_method={strategy_config.weighting_method!r}; expected 'equal' or 'markowitz_min_vol'"
         )
 
     total_alloc = allocations_df["Allocation"].sum()
-    if not np.isclose(total_alloc, 1.0):
-        raise ValueError(f"Total allocation sums to {total_alloc:.4f}, expected 1.0")
+    if not np.isclose(total_alloc, strategy_config.target_net_exposure):
+        raise ValueError(f"Total allocation sums to {total_alloc:.4f}, expected {strategy_config.target_net_exposure:.4f}")
 
     allocations_df = allocations_df.sort_values("Coreness", ascending=True).reset_index(
         drop=True
@@ -690,6 +750,7 @@ def get_rebalance_allocations(
     ticker_list: Union[List[str], Callable[[str], List[str]]],
     rebalance_dates: List[pd.Timestamp],
     lookback_days: int,
+    strategy_config: StrategyConfig,
     parallel: bool = False,
 ) -> Dict[pd.Timestamp, pd.DataFrame]:
     """
@@ -699,12 +760,15 @@ def get_rebalance_allocations(
         ticker_list: List of stock tickers OR callable that takes date string and returns ticker list
         rebalance_dates: List of rebalance dates
         lookback_days: Number of days of history to use for Rossa
+        strategy_config: Portfolio construction settings for the backtest
         parallel: If True, uses multiprocessing pool for parallel execution. Default False (sequential).
 
     Returns:
         Dictionary mapping rebalance_date -> allocation DataFrame
     """
-    args_list = [(date, ticker_list, lookback_days) for date in rebalance_dates]
+    args_list = [
+        (date, ticker_list, lookback_days, strategy_config) for date in rebalance_dates
+    ]
 
     if parallel and len(rebalance_dates) > 1:
         # Use multiprocessing pool for parallel execution
@@ -1008,6 +1072,7 @@ def export_benchmark_data_to_excel(
     benchmark_data: Dict[str, pd.DataFrame],
     benchmark_metrics: Dict[str, Dict],
     output_filename: str = "backtest_results.xlsx",
+    export_config: Optional[ExcelExportConfig] = None,
 ) -> None:
     """
     Export benchmark data and metrics to Excel sheets.
@@ -1020,12 +1085,14 @@ def export_benchmark_data_to_excel(
         benchmark_data: Dictionary mapping benchmark_ticker -> daily_metrics_df
         benchmark_metrics: Dictionary mapping benchmark_ticker -> summary_stats_dict
         output_filename: Output Excel filename (will append to existing)
+        export_config: Lossless Excel writer settings
     """
+    export_config = export_config or ExcelExportConfig()
     # Append to existing Excel file
     with pd.ExcelWriter(
         output_filename, engine="openpyxl", mode="a", if_sheet_exists="replace"
     ) as writer:
-        _write_benchmark_sheets(writer, benchmark_data, benchmark_metrics)
+        _write_benchmark_sheets(writer, benchmark_data, benchmark_metrics, export_config)
 
     logger.info(f"Benchmark data exported to Excel: {output_filename}")
 
@@ -1034,12 +1101,13 @@ def _write_benchmark_sheets(
     writer: pd.ExcelWriter,
     benchmark_data: Optional[Dict[str, pd.DataFrame]],
     benchmark_metrics: Optional[Dict[str, Dict]],
+    export_config: ExcelExportConfig,
 ) -> None:
     """Write benchmark sheets into an open Excel workbook."""
     if benchmark_data:
         for ticker, daily_metrics in benchmark_data.items():
-            daily_metrics.to_excel(
-                writer, sheet_name=f"Benchmark_{ticker}", index=False
+            _write_dataframe_sheet(
+                writer, daily_metrics, sheet_name=f"Benchmark_{ticker}", index=False
             )
 
     if benchmark_metrics:
@@ -1049,9 +1117,79 @@ def _write_benchmark_sheets(
             row.update(metrics)
             metrics_rows.append(row)
 
-        pd.DataFrame(metrics_rows).to_excel(
-            writer, sheet_name="Benchmark_Metrics", index=False
+        _write_dataframe_sheet(
+            writer,
+            pd.DataFrame(metrics_rows),
+            sheet_name="Benchmark_Metrics",
+            index=False,
         )
+
+
+def _is_xlsxwriter_writer(writer: pd.ExcelWriter) -> bool:
+    """Return whether the active Excel writer uses xlsxwriter."""
+    return writer.engine == "xlsxwriter"
+
+
+def _write_dataframe_sheet(
+    writer: pd.ExcelWriter,
+    df: pd.DataFrame,
+    sheet_name: str,
+    index: bool = False,
+) -> None:
+    """Write a dataframe, using direct worksheet writes for xlsxwriter."""
+    if not _is_xlsxwriter_writer(writer):
+        df.to_excel(writer, sheet_name=sheet_name, index=index)
+        return
+
+    worksheet = writer.book.add_worksheet(sheet_name)
+    writer.sheets[sheet_name] = worksheet
+    date_format = writer.book.add_format({"num_format": "yyyy-mm-dd"})
+    datetime_format = writer.book.add_format({"num_format": "yyyy-mm-dd hh:mm:ss"})
+
+    export_df = df.reset_index() if index else df
+    headers = export_df.columns.tolist()
+    worksheet.write_row(0, 0, headers)
+
+    for row_idx, row in enumerate(export_df.itertuples(index=False, name=None), start=1):
+        for col_idx, value in enumerate(row):
+            if pd.isna(value):
+                continue
+            if isinstance(value, pd.Timestamp):
+                if value.time() == pd.Timestamp(value.date()).time():
+                    worksheet.write_datetime(row_idx, col_idx, value.to_pydatetime(), date_format)
+                else:
+                    worksheet.write_datetime(
+                        row_idx, col_idx, value.to_pydatetime(), datetime_format
+                    )
+            else:
+                worksheet.write(row_idx, col_idx, value)
+
+
+def _write_wide_timeseries_sheet(
+    writer: pd.ExcelWriter,
+    wide_df: pd.DataFrame,
+    sheet_name: str,
+) -> None:
+    """Write a date-indexed wide dataframe efficiently and losslessly."""
+    if not _is_xlsxwriter_writer(writer):
+        wide_df.to_excel(writer, sheet_name=sheet_name)
+        return
+
+    worksheet = writer.book.add_worksheet(sheet_name)
+    writer.sheets[sheet_name] = worksheet
+    date_format = writer.book.add_format({"num_format": "yyyy-mm-dd"})
+
+    headers = ["Date"] + [str(col) for col in wide_df.columns]
+    worksheet.write_row(0, 0, headers)
+
+    values = wide_df.to_numpy()
+    dates = pd.to_datetime(wide_df.index)
+    for row_idx, (date_value, row_values) in enumerate(zip(dates, values), start=1):
+        worksheet.write_datetime(row_idx, 0, date_value.to_pydatetime(), date_format)
+        for col_idx, value in enumerate(row_values, start=1):
+            if pd.isna(value):
+                continue
+            worksheet.write(row_idx, col_idx, value)
 
 
 def _write_backtest_sheets(
@@ -1062,6 +1200,7 @@ def _write_backtest_sheets(
     summary_stats: Dict,
     benchmark_data: Optional[Dict[str, pd.DataFrame]],
     benchmark_metrics: Optional[Dict[str, Dict]],
+    export_config: ExcelExportConfig,
 ) -> None:
     """Write all backtest result sheets into an open Excel workbook."""
     # Sheet 1: Daily Holdings (pivoted by ticker)
@@ -1074,13 +1213,13 @@ def _write_backtest_sheets(
         .first()
         .unstack()
     )
-    position_pivot.to_excel(writer, sheet_name="Position Values ($)")
+    _write_wide_timeseries_sheet(writer, position_pivot, sheet_name="Position Values ($)")
 
     # Pivot prices by ticker (optional, for reference)
     price_pivot = (
         daily_export.groupby(["Date", "Ticker"], sort=False)["Price"].first().unstack()
     )
-    price_pivot.to_excel(writer, sheet_name="Prices ($)")
+    _write_wide_timeseries_sheet(writer, price_pivot, sheet_name="Prices ($)")
 
     # Add portfolio total value (same for all tickers on each date)
     portfolio_total = (
@@ -1088,7 +1227,9 @@ def _write_backtest_sheets(
         .drop_duplicates(subset=["Date"])
         .set_index("Date")
     )
-    portfolio_total.to_excel(writer, sheet_name="Portfolio Total")
+    _write_dataframe_sheet(
+        writer, portfolio_total.reset_index(), sheet_name="Portfolio Total", index=False
+    )
 
     # Sheet 2: Portfolio Metrics (separate sheet for each metric)
     portfolio_export = portfolio_summary.copy()
@@ -1104,7 +1245,7 @@ def _write_backtest_sheets(
         if metric in portfolio_export.columns:
             metric_df = portfolio_export[["Date", metric]].copy()
             sheet_name = metric.replace("_", " ")
-            metric_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            _write_dataframe_sheet(writer, metric_df, sheet_name=sheet_name, index=False)
 
     # Sheet 3: Performance Metrics
     metrics_data = [
@@ -1125,7 +1266,9 @@ def _write_backtest_sheets(
         ["Max Drawdown", f"{summary_stats['Max_Drawdown'] * 100:.2f}%"],
     ]
     metrics_df = pd.DataFrame(metrics_data[1:], columns=metrics_data[0])
-    metrics_df.to_excel(writer, sheet_name="Performance Metrics", index=False)
+    _write_dataframe_sheet(
+        writer, metrics_df, sheet_name="Performance Metrics", index=False
+    )
 
     # Sheet 4: Rebalance Events
     rebalance_events = []
@@ -1142,9 +1285,11 @@ def _write_backtest_sheets(
             )
 
     rebalance_df = pd.DataFrame(rebalance_events)
-    rebalance_df.to_excel(writer, sheet_name="Rebalance Events", index=False)
+    _write_dataframe_sheet(
+        writer, rebalance_df, sheet_name="Rebalance Events", index=False
+    )
 
-    _write_benchmark_sheets(writer, benchmark_data, benchmark_metrics)
+    _write_benchmark_sheets(writer, benchmark_data, benchmark_metrics, export_config)
 
 
 def export_to_excel(
@@ -1155,6 +1300,7 @@ def export_to_excel(
     benchmark_data: Optional[Dict[str, pd.DataFrame]] = None,
     benchmark_metrics: Optional[Dict[str, Dict]] = None,
     output_filename: str = "backtest_results.xlsx",
+    export_config: Optional[ExcelExportConfig] = None,
 ) -> None:
     """
     Export backtest results to Excel workbook with separate sheets for each metric.
@@ -1176,7 +1322,10 @@ def export_to_excel(
         benchmark_data: Optional benchmark daily data to write in the same workbook
         benchmark_metrics: Optional benchmark summary stats to write in the same workbook
         output_filename: Output Excel filename
+        export_config: Lossless Excel writer settings
     """
+    export_config = export_config or ExcelExportConfig()
+
     # DEBUG: Check data integrity before export
     last_date = daily_holdings["Date"].max()
     last_day_holdings = daily_holdings[daily_holdings["Date"] == last_date]
@@ -1198,6 +1347,9 @@ def export_to_excel(
             output_filename,
             engine="xlsxwriter",
             datetime_format="yyyy-mm-dd",
+            engine_kwargs={
+                "options": {"constant_memory": export_config.use_constant_memory}
+            },
         ) as writer:
             _write_backtest_sheets(
                 writer,
@@ -1207,6 +1359,7 @@ def export_to_excel(
                 summary_stats,
                 benchmark_data,
                 benchmark_metrics,
+                export_config,
             )
     except ModuleNotFoundError:
         logger.warning(
@@ -1221,6 +1374,7 @@ def export_to_excel(
                 summary_stats,
                 benchmark_data,
                 benchmark_metrics,
+                export_config,
             )
 
     logger.info(f"Excel report exported: {output_filename}")
@@ -1369,6 +1523,83 @@ def plot_backtest_results(
     output_file = os.path.join(output_dir, "backtest_plots.png")
     plt.savefig(output_file, dpi=150, bbox_inches="tight")
     logger.info(f"Plots saved: {output_file}")
+    plt.close()
+
+
+def plot_backtest_results_log(
+    portfolio_summary: pd.DataFrame,
+    benchmark_data: Optional[Dict[str, pd.DataFrame]] = None,
+    output_dir: str = ".",
+) -> None:
+    """
+    Create log-scale performance plots for easier long-horizon comparison.
+
+    Generates:
+    - Portfolio value over time on a log y-axis
+    - Growth of $1 on a log y-axis
+    """
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8))
+
+    strategy_growth = portfolio_summary["Portfolio_Value"] / portfolio_summary[
+        "Portfolio_Value"
+    ].iloc[0]
+
+    axes[0].plot(
+        portfolio_summary["Date"],
+        portfolio_summary["Portfolio_Value"],
+        linewidth=2.5,
+        color="blue",
+        label="Strategy",
+        zorder=10,
+    )
+    axes[1].plot(
+        portfolio_summary["Date"],
+        strategy_growth,
+        linewidth=2.5,
+        color="green",
+        label="Strategy",
+        zorder=10,
+    )
+
+    if benchmark_data:
+        colors = plt.cm.Set2(np.linspace(0, 1, len(benchmark_data)))
+        for (ticker, bench_df), color in zip(benchmark_data.items(), colors):
+            benchmark_growth = bench_df["Portfolio_Value"] / bench_df["Portfolio_Value"].iloc[0]
+            axes[0].plot(
+                bench_df["Date"],
+                bench_df["Portfolio_Value"],
+                linewidth=1.5,
+                color=color,
+                label=ticker,
+                alpha=0.7,
+            )
+            axes[1].plot(
+                bench_df["Date"],
+                benchmark_growth,
+                linewidth=1.5,
+                color=color,
+                label=ticker,
+                alpha=0.7,
+            )
+
+    axes[0].set_yscale("log")
+    axes[0].set_title("Portfolio Value Over Time (Log Scale)", fontsize=14, fontweight="bold")
+    axes[0].set_xlabel("Date")
+    axes[0].set_ylabel("Portfolio Value ($, log)")
+    axes[0].grid(True, alpha=0.3, which="both")
+    axes[0].legend(loc="upper left", fontsize=9)
+
+    axes[1].set_yscale("log")
+    axes[1].set_title("Growth of $1 (Log Scale)", fontsize=14, fontweight="bold")
+    axes[1].set_xlabel("Date")
+    axes[1].set_ylabel("Growth Multiple (log)")
+    axes[1].grid(True, alpha=0.3, which="both")
+    axes[1].legend(loc="upper left", fontsize=9)
+
+    plt.tight_layout()
+    output_file = os.path.join(output_dir, "backtest_plots_log.png")
+    plt.savefig(output_file, dpi=150, bbox_inches="tight")
+    logger.info(f"Log-scale plots saved: {output_file}")
     plt.close()
 
 
@@ -1845,6 +2076,7 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
         config.ticker_list,
         rebalance_dates,
         config.lookback_days,
+        config.strategy,
         parallel=config.parallel,
     )
 
@@ -1892,6 +2124,7 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
             benchmark_data,
             benchmark_metrics,
             output_excel_path,
+            config.excel_export,
         )
 
     # Export summary text file
@@ -1908,6 +2141,9 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
     if config.output_plots:
         os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
         plot_backtest_results(
+            portfolio_summary, benchmark_data, output_dir=str(DataConfig.OUTPUT_DIR)
+        )
+        plot_backtest_results_log(
             portfolio_summary, benchmark_data, output_dir=str(DataConfig.OUTPUT_DIR)
         )
 
