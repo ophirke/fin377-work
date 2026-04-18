@@ -549,15 +549,15 @@ def main() -> None:
 
     logger.info(f"Loaded {len(ticker_list)} tickers from {DataConfig.TICKER_FILE}")
     
-    ticker_list = load_nasdaq100_constituents("2018-01-01")
+    ticker_list = load_sp500_constituents("2026-04-13")
 
     # Run analysis with visualization (0.55 threshold avoids the "gravity well" singularity)
     results = analyze_core_periphery(
         ticker_list=ticker_list,
-        price_history_start_date="2018-01-01",
+        price_history_start_date="2021-04-13",
         price_history_end_date=None,
         visualize_filename=f"{DataConfig.OUTPUT_DIR}/core_periphery_network.png",
-        corr_threshold=0.5,
+        corr_threshold=0.3,
     )
 
 

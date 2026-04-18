@@ -1267,7 +1267,7 @@ def plot_last_snapshot_network(
     portfolio_snapshots: pd.DataFrame,
     lookback_days: int,
     output_dir: str,
-    corr_threshold: float = 0.55,
+    corr_threshold: float = 0.3,
 ) -> Optional[str]:
     """Plot the core-periphery network for the most recent portfolio snapshot."""
     if portfolio_snapshots is None or portfolio_snapshots.empty:
@@ -1317,7 +1317,7 @@ def plot_last_snapshot_network(
             node_alpha_map[ticker] = 0.9
         else:
             node_size_map[ticker] = 120 + 600 * strength
-            node_alpha_map[ticker] = 0.2
+            node_alpha_map[ticker] = 0.9
 
     output_path = os.path.join(output_dir, "last_snap_network.png")
     rossa.plot_network(
