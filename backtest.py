@@ -627,6 +627,102 @@ def _allocate_equal_weights(
     return allocations_df
 
 
+def _allocate_capped_proportional_weights(
+    strengths: pd.Series,
+    total_exposure: float,
+    max_weight: float,
+) -> pd.Series:
+    """Allocate exposure proportionally to strengths while respecting a cap."""
+    if len(strengths) == 0:
+        return strengths.copy()
+
+    if total_exposure < 0:
+        raise ValueError("total_exposure must be non-negative")
+    if max_weight <= 0:
+        raise ValueError("max_weight must be positive")
+    if max_weight * len(strengths) + 1e-12 < total_exposure:
+        raise ValueError("max_weight is too small to satisfy total_exposure")
+
+    positive_strengths = strengths.astype(float).clip(lower=0.0)
+    if positive_strengths.sum() <= 0:
+        positive_strengths = pd.Series(1.0, index=strengths.index, dtype=float)
+
+    allocations = pd.Series(0.0, index=positive_strengths.index, dtype=float)
+    remaining = positive_strengths.copy()
+    remaining_exposure = float(total_exposure)
+
+    while len(remaining) > 0 and remaining_exposure > 1e-12:
+        scaled = remaining / remaining.sum() * remaining_exposure
+        capped_mask = scaled >= max_weight - 1e-12
+
+        if not capped_mask.any():
+            allocations.loc[remaining.index] += scaled
+            remaining_exposure = 0.0
+            break
+
+        capped_names = scaled.index[capped_mask]
+        allocations.loc[capped_names] = max_weight
+        remaining_exposure -= max_weight * len(capped_names)
+        remaining = remaining.loc[~remaining.index.isin(capped_names)]
+
+        if remaining_exposure < -1e-9:
+            raise ValueError("Exposure allocation overshot while applying caps")
+
+    if not np.isclose(allocations.sum(), total_exposure):
+        raise ValueError(
+            f"Allocated exposure sums to {allocations.sum():.6f}, expected {total_exposure:.6f}"
+        )
+
+    return allocations
+
+
+def _allocate_coreness_proportional(
+    results_df: pd.DataFrame,
+    is_long: pd.Series,
+    is_short: pd.Series,
+    coreness_threshold: float,
+    strategy_config: StrategyConfig,
+) -> pd.DataFrame:
+    """Allocate exposures continuously from coreness distance within each side."""
+    long_total, short_total = _get_side_exposures(strategy_config)
+    max_long_weight = strategy_config.resolved_max_long_weight
+    max_short_weight = strategy_config.resolved_max_short_weight
+    long_coreness = results_df.loc[is_long, ["Stock", "Coreness"]].set_index("Stock")[
+        "Coreness"
+    ]
+    short_coreness = results_df.loc[is_short, ["Stock", "Coreness"]].set_index("Stock")[
+        "Coreness"
+    ]
+
+    if strategy_config.long_periphery:
+        long_strengths = coreness_threshold - long_coreness
+        short_strengths = short_coreness - coreness_threshold
+    else:
+        long_strengths = long_coreness - coreness_threshold
+        short_strengths = coreness_threshold - short_coreness
+
+    long_weights = _allocate_capped_proportional_weights(
+        long_strengths,
+        total_exposure=long_total,
+        max_weight=max_long_weight,
+    )
+    short_weights = _allocate_capped_proportional_weights(
+        short_strengths,
+        total_exposure=short_total,
+        max_weight=max_short_weight,
+    )
+
+    allocations_df = results_df.copy()
+    allocations_df["Allocation"] = 0.0
+    allocations_df.loc[is_long, "Allocation"] = allocations_df.loc[is_long, "Stock"].map(
+        long_weights
+    )
+    allocations_df.loc[is_short, "Allocation"] = -allocations_df.loc[
+        is_short, "Stock"
+    ].map(short_weights)
+    return allocations_df
+
+
 def _allocate_markowitz_min_vol(
     results_df: pd.DataFrame,
     is_long: pd.Series,
@@ -723,6 +819,14 @@ def allocate_by_coreness(
         allocations_df = _allocate_equal_weights(
             allocations_df, is_long, is_short, strategy_config
         )
+    elif strategy_config.weighting_method == "coreness_proportional":
+        allocations_df = _allocate_coreness_proportional(
+            allocations_df,
+            is_long,
+            is_short,
+            coreness_threshold,
+            strategy_config,
+        )
     elif strategy_config.weighting_method == "markowitz_min_vol":
         if log_returns is None:
             raise ValueError("log_returns are required for Markowitz weighting")
@@ -731,7 +835,8 @@ def allocate_by_coreness(
         )
     else:
         raise ValueError(
-            f"Unknown weighting_method={strategy_config.weighting_method!r}; expected 'equal' or 'markowitz_min_vol'"
+            f"Unknown weighting_method={strategy_config.weighting_method!r}; expected "
+            f"'equal', 'coreness_proportional', or 'markowitz_min_vol'"
         )
 
     total_alloc = allocations_df["Allocation"].sum()

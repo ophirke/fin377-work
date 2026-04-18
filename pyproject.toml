@@ -9,10 +9,13 @@ dependencies = [
     "matplotlib>=3.8.0",
     "networkx>=3.2",
     "openpyxl>=3.1.0",
+    "xlsxwriter>=3.2.0",
     "scipy>=1.17.1",
     "statsmodels>=0.14.6",
+    "streamlit>=1.44.0",
     "tqdm>=4.67.3",
     "n100tickers",
+    "edgartools>=5.30.0",
 ]
 
 [tool.uv.workspace]

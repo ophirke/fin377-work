@@ -124,8 +124,12 @@ def _build_config_from_sidebar(default_config: Optional[BacktestConfig]) -> Back
     )
     weighting_method = st.sidebar.selectbox(
         "Weighting method",
-        ["equal", "markowitz_min_vol"],
-        index=0 if default_strategy.weighting_method == "equal" else 1,
+        ["equal", "coreness_proportional", "markowitz_min_vol"],
+        index=["equal", "coreness_proportional", "markowitz_min_vol"].index(
+            default_strategy.weighting_method
+        )
+        if default_strategy.weighting_method in ["equal", "coreness_proportional", "markowitz_min_vol"]
+        else 0,
     )
     max_long_weight = st.sidebar.number_input(
         "Max long weight",
