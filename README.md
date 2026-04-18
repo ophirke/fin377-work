@@ -8,7 +8,7 @@ Install uv (https://docs.astral.sh/uv/getting-started/installation/#__tabbed_1_1
 
 ## Open the project in a code IDE (VS code) / terminal
 - in terminal, do `uv run runconfig.py`
-- for a basic local UI, do `uv run streamlit run app.py`
+- for a basic local UI, do `uv run streamlit run app.py`, it should open automatically, or go to http://localhost:8501/ in your browser
 
 It should generate accordingly.
 Backtests and step-forward evaluations are now defined in `runconfig.py` inside `create_backtests()`.
