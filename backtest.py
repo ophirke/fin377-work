@@ -15,6 +15,7 @@ from multiprocessing import Pool
 from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -38,6 +39,7 @@ from factor import (
 )
 
 NUM_WORKERS = max(1, min(12, multiprocessing.cpu_count() - 4))
+CASH_PROXY_TICKER = "__CASH__"
 
 # ============================================================================
 # BACKTEST CONFIGURATION
@@ -50,11 +52,23 @@ class StrategyConfig:
 
     target_net_exposure: float = 1.0
     short_amount: float = 0.90
+    enable_market_drawdown_stop: bool = False
+    market_drawdown_threshold: float = 0.10
+    market_drawdown_ticker: str = "SPY"
+    market_drawdown_action: str = "hold"  # Options: "hold", "invert"
     periphery_threshold_quantile: float = 0.05
+    short_selection_quantile: Optional[float] = None
     long_periphery: bool = True
-    weighting_method: str = (
-        "equal"  # Options: "equal", "coreness_proportional", "markowitz_min_vol"
-    )
+    selection_mode: str = "quantile"  # Options: "quantile", "top_m"
+    portfolio_size: Optional[int] = None
+    rank_ties_by_sharpe: bool = False
+    cash_hold_ratio: float = 0.0
+    explicit_long_tickers: Tuple[str, ...] = ()
+    explicit_long_total: float = 0.0
+    explicit_short_tickers: Tuple[str, ...] = ()
+    explicit_short_total: float = 0.0
+    network_filter: str = "none"
+    weighting_method: str = "equal"  # Options: "equal", "coreness_proportional", "risk_parity", "markowitz_min_vol", "markowitz_max_sharpe"
     max_long_weight: Optional[float] = None
     max_short_weight: Optional[float] = None
 
@@ -66,28 +80,117 @@ class StrategyConfig:
         return 1.0 - self.periphery_threshold_quantile
 
     @property
+    def normalized_market_drawdown_ticker(self) -> str:
+        """Normalized market proxy ticker used for the drawdown gate."""
+        return str(self.market_drawdown_ticker).strip().upper()
+
+    @property
+    def validated_market_drawdown_threshold(self) -> float:
+        """Validated drawdown-stop threshold expressed as a decimal."""
+        threshold = float(self.market_drawdown_threshold)
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("market_drawdown_threshold must be between 0.0 and 1.0")
+        return threshold
+
+    @property
+    def validated_market_drawdown_action(self) -> str:
+        """Validated behavior while the market drawdown condition is active."""
+        action = str(self.market_drawdown_action).strip().lower()
+        if action not in {"hold", "invert"}:
+            raise ValueError(
+                "market_drawdown_action must be either 'hold' or 'invert'"
+            )
+        return action
+
+    @property
+    def investable_ratio(self) -> float:
+        """Fraction of capital available for investment after holding cash."""
+        if not 0.0 <= self.cash_hold_ratio <= 1.0:
+            raise ValueError("cash_hold_ratio must be between 0.0 and 1.0")
+        return 1.0 - self.cash_hold_ratio
+
+    @property
+    def scaled_explicit_long_total(self) -> float:
+        """Scaled explicit long overlay after reserving cash."""
+        return self.investable_ratio * self.explicit_long_total
+
+    @property
+    def scaled_explicit_short_total(self) -> float:
+        """Scaled explicit short overlay after reserving cash."""
+        return self.investable_ratio * self.explicit_short_total
+
+    @property
     def gross_long_exposure(self) -> float:
         """Total positive exposure target."""
-        return self.target_net_exposure + self.short_amount
+        return self.investable_ratio * (
+            self.target_net_exposure
+            + self.short_amount
+            - self.explicit_long_total
+            + self.explicit_short_total
+        )
 
     @property
     def gross_short_exposure(self) -> float:
-        """Total absolute short exposure target."""
-        return self.short_amount
+        """Total absolute short exposure target across all short books."""
+        return self.investable_ratio * (
+            self.short_amount + self.explicit_short_total
+        )
+
+    @property
+    def coreness_short_exposure(self) -> float:
+        """Absolute short exposure assigned to the coreness-selected short book."""
+        return self.investable_ratio * self.short_amount
+
+    @property
+    def coreness_book_net_exposure(self) -> float:
+        """Net exposure of the coreness-managed book before explicit short overlays."""
+        return self.investable_ratio * (
+            self.target_net_exposure
+            - self.explicit_long_total
+            + self.explicit_short_total
+        )
+
+    @property
+    def invested_net_exposure(self) -> float:
+        """Net exposure carried by invested assets after reserving cash."""
+        return self.investable_ratio * self.target_net_exposure
 
     @property
     def resolved_max_long_weight(self) -> float:
         """Per-name cap for long positions."""
         if self.max_long_weight is not None:
-            return self.max_long_weight
+            return self.investable_ratio * self.max_long_weight
         return self.gross_long_exposure
 
     @property
     def resolved_max_short_weight(self) -> float:
         """Per-name cap for short positions."""
         if self.max_short_weight is not None:
-            return self.max_short_weight
-        return self.gross_short_exposure
+            return self.investable_ratio * self.max_short_weight
+        return self.coreness_short_exposure
+
+    @property
+    def normalized_explicit_short_tickers(self) -> Tuple[str, ...]:
+        """Return deduplicated explicit short tickers in uppercase."""
+        return self._normalize_overlay_tickers(self.explicit_short_tickers)
+
+    @property
+    def normalized_explicit_long_tickers(self) -> Tuple[str, ...]:
+        """Return deduplicated explicit long tickers in uppercase."""
+        return self._normalize_overlay_tickers(self.explicit_long_tickers)
+
+    @staticmethod
+    def _normalize_overlay_tickers(tickers: Tuple[str, ...]) -> Tuple[str, ...]:
+        """Normalize explicit overlay tickers."""
+        seen = set()
+        normalized = []
+        for ticker in tickers:
+            clean = str(ticker).strip().upper()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            normalized.append(clean)
+        return tuple(normalized)
 
 
 @dataclass(frozen=True)
@@ -106,6 +209,7 @@ class BacktestConfig:
     end_backtest_date: str
     lookback_days: int
     rebalance_interval_days: int
+    signal_recalculation_interval_days: Optional[int] = None
     output_excel: Optional[str] = None
     output_plots: bool = False
     do_plot_network: bool = False
@@ -114,6 +218,7 @@ class BacktestConfig:
     factor_lookback_days: Optional[int] = None
     snapshot_factor_lookback_days: Optional[int] = None
     factor_data_file: str = "factor_returns.xlsx"
+    output_dir: Union[str, os.PathLike] = field(default_factory=lambda: str(DataConfig.OUTPUT_DIR))
     summary_file: Optional[str] = None
     parallel: bool = False
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
@@ -231,6 +336,7 @@ class StepForwardBacktestRun:
     eval_lookback: pd.DateOffset
     eval_interval: pd.DateOffset
     summary_plot_filename: Optional[str] = None
+    summary_excel_filename: Optional[str] = None
     parallel: bool = True
 
 
@@ -260,6 +366,11 @@ logger = logging.getLogger(__name__)
 
 
 RF_RATE = 0.03
+
+
+def _resolved_output_dir(config: BacktestConfig) -> str:
+    """Return the directory where generated artifacts should be saved."""
+    return str(config.output_dir)
 
 
 def calculate_benchmark_daily_values(
@@ -429,6 +540,37 @@ def generate_rebalance_dates(
     return list(dates)
 
 
+def expand_trade_schedule(
+    signal_schedule: Dict[pd.Timestamp, pd.DataFrame],
+    trade_dates: List[pd.Timestamp],
+) -> Dict[pd.Timestamp, pd.DataFrame]:
+    """
+    Expand signal allocations into an execution schedule.
+
+    Each trade date uses the most recent signal computed on or before that date.
+    This allows holdings to be rebalanced back to target weights between slower
+    signal recalculation dates.
+    """
+    if not signal_schedule or not trade_dates:
+        return {}
+
+    signal_dates = sorted(signal_schedule.keys())
+    execution_schedule: Dict[pd.Timestamp, pd.DataFrame] = {}
+
+    for trade_date in trade_dates:
+        eligible_signal_dates = [d for d in signal_dates if d <= trade_date]
+        if not eligible_signal_dates:
+            continue
+
+        signal_date = eligible_signal_dates[-1]
+        trade_allocations = signal_schedule[signal_date].copy()
+        trade_allocations["SignalDate"] = signal_date
+        trade_allocations["RebalanceDate"] = trade_date
+        execution_schedule[trade_date] = trade_allocations
+
+    return execution_schedule
+
+
 def _compute_allocation_for_rebalance_date(
     args: Tuple,
 ) -> Tuple[pd.Timestamp, pd.DataFrame]:
@@ -445,11 +587,19 @@ def _compute_allocation_for_rebalance_date(
     """
     rebalance_date, ticker_list, lookback_days, strategy = args
 
+    overlay_excluded_tickers = set(strategy.normalized_explicit_short_tickers)
+    overlay_excluded_tickers.update(strategy.normalized_explicit_long_tickers)
+
     # Get tickers for this rebalance date (dynamic or static)
     if callable(ticker_list):
         current_tickers = list(ticker_list(rebalance_date.strftime("%Y-%m-%d")))
     else:
         current_tickers = ticker_list
+    analysis_tickers = [
+        ticker
+        for ticker in current_tickers
+        if str(ticker).strip().upper() not in overlay_excluded_tickers
+    ]
 
     # Calculate lookback window
     lookback_start = rebalance_date - timedelta(days=lookback_days)
@@ -461,20 +611,32 @@ def _compute_allocation_for_rebalance_date(
     )
 
     _, log_returns = rossa.load_analysis_price_data(
-        ticker_list=current_tickers,
+        ticker_list=analysis_tickers,
         price_history_start_date=lookback_start.strftime("%Y-%m-%d"),
         price_history_end_date=analysis_end_date.strftime("%Y-%m-%d"),
     )
-    A, ticker_names = rossa.build_adjacency_matrix(log_returns)
+    A, ticker_names = rossa.build_filtered_network(
+        log_returns,
+        network_filter=strategy.network_filter,
+    )
     results = rossa.rossa_core_periphery(A, ticker_names)
 
     # Get allocations based on coreness
     allocations = allocate_by_coreness(
         results, strategy_config=strategy, log_returns=log_returns
     )
+    allocations = _append_explicit_longs(allocations, strategy)
+    allocations = _append_explicit_shorts(allocations, strategy)
+    total_allocation = float(allocations["Allocation"].sum())
+    expected_total_allocation = strategy.invested_net_exposure
+    if not np.isclose(total_allocation, expected_total_allocation):
+        raise ValueError(
+            f"Total allocation sums to {total_allocation:.4f}, expected {expected_total_allocation:.4f}"
+        )
 
     # Add rebalance metadata
     allocations["RebalanceDate"] = rebalance_date
+    allocations["SignalDate"] = rebalance_date
     allocations["Coreness_Rank"] = range(1, len(allocations) + 1)  # 1 = most peripheral
 
     logger.info(f"  → {len(allocations)} stocks allocated")
@@ -557,27 +719,172 @@ def _allocate_by_coreness_equal_legacy(
 
 
 def _get_side_exposures(strategy_config: StrategyConfig) -> Tuple[float, float]:
-    """Return target gross exposures for the long and short books."""
-    return strategy_config.gross_long_exposure, strategy_config.gross_short_exposure
+    """Return target exposures for the coreness-managed long and short books."""
+    return strategy_config.gross_long_exposure, strategy_config.coreness_short_exposure
+
+
+def _append_explicit_shorts(
+    allocations_df: pd.DataFrame,
+    strategy_config: StrategyConfig,
+) -> pd.DataFrame:
+    """Append user-specified short positions on top of the coreness portfolio."""
+    explicit_tickers = strategy_config.normalized_explicit_short_tickers
+    explicit_short_total = float(strategy_config.scaled_explicit_short_total)
+
+    if explicit_short_total > 1e-12 and len(explicit_tickers) == 0:
+        raise ValueError("explicit_short_total requires at least one explicit short ticker")
+    if explicit_short_total <= 1e-12 or len(explicit_tickers) == 0:
+        return allocations_df
+
+    short_weight = -explicit_short_total / len(explicit_tickers)
+    extra_rows = pd.DataFrame(
+        {
+            "Stock": list(explicit_tickers),
+            "Coreness": np.nan,
+            "Allocation": short_weight,
+            "Coreness_Rank": np.nan,
+        }
+    )
+    return pd.concat([allocations_df, extra_rows], ignore_index=True)
+
+
+def _append_explicit_longs(
+    allocations_df: pd.DataFrame,
+    strategy_config: StrategyConfig,
+) -> pd.DataFrame:
+    """Append user-specified long positions on top of the coreness portfolio."""
+    explicit_tickers = strategy_config.normalized_explicit_long_tickers
+    explicit_long_total = float(strategy_config.scaled_explicit_long_total)
+
+    if explicit_long_total > 1e-12 and len(explicit_tickers) == 0:
+        raise ValueError("explicit_long_total requires at least one explicit long ticker")
+    if explicit_long_total <= 1e-12 or len(explicit_tickers) == 0:
+        return allocations_df
+
+    long_weight = explicit_long_total / len(explicit_tickers)
+    extra_rows = pd.DataFrame(
+        {
+            "Stock": list(explicit_tickers),
+            "Coreness": np.nan,
+            "Allocation": long_weight,
+            "Coreness_Rank": np.nan,
+        }
+    )
+    return pd.concat([allocations_df, extra_rows], ignore_index=True)
+
+
+def _rank_stocks_for_selection(
+    results_df: pd.DataFrame,
+    strategy_config: StrategyConfig,
+    log_returns: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Rank stocks for top-m selection, optionally breaking coreness ties by Sharpe."""
+    ranked = results_df.copy()
+    ranked["Trailing_Sharpe"] = 0.0
+
+    if strategy_config.rank_ties_by_sharpe and log_returns is not None:
+        trailing_mean = log_returns.mean()
+        trailing_std = log_returns.std().replace(0.0, np.nan)
+        trailing_sharpe = (trailing_mean / trailing_std).replace(
+            [np.inf, -np.inf], np.nan
+        )
+        ranked["Trailing_Sharpe"] = ranked["Stock"].map(trailing_sharpe).fillna(0.0)
+
+    ascending_coreness = bool(strategy_config.long_periphery)
+    sharpe_ascending = not ascending_coreness
+    ranked = ranked.sort_values(
+        by=["Coreness", "Trailing_Sharpe", "Stock"],
+        ascending=[ascending_coreness, sharpe_ascending, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    return ranked
 
 
 def _classify_coreness_buckets(
     results_df: pd.DataFrame,
     strategy_config: StrategyConfig,
-) -> Tuple[pd.DataFrame, pd.Series, pd.Series, float]:
+    log_returns: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.DataFrame, pd.Series, pd.Series, float, float]:
     """Split stocks into long and short books based on coreness."""
-    quantile_prop = strategy_config.effective_periphery_quantile
-    coreness_threshold = results_df["Coreness"].quantile(quantile_prop)
-    is_core = results_df["Coreness"] >= coreness_threshold
+    if strategy_config.selection_mode == "top_m":
+        if (
+            strategy_config.portfolio_size is None
+            or strategy_config.portfolio_size <= 0
+        ):
+            raise ValueError("portfolio_size must be set when selection_mode='top_m'")
+
+        ranked = _rank_stocks_for_selection(results_df, strategy_config, log_returns)
+        n_select = min(int(strategy_config.portfolio_size), len(ranked))
+        long_positions = ranked.index[:n_select]
+        is_long = ranked.index.isin(long_positions)
+
+        if strategy_config.gross_short_exposure > 1e-12:
+            short_positions = ranked.index[-n_select:]
+            is_short = ranked.index.isin(short_positions)
+        else:
+            is_short = np.zeros(len(ranked), dtype=bool)
+
+        if np.any(is_long & is_short):
+            overlap_idx = np.where(is_long & is_short)[0]
+            is_short = is_short.copy()
+            is_short[overlap_idx] = False
+
+        long_threshold = float(ranked.loc[long_positions[-1], "Coreness"])
+        short_threshold = (
+            float(ranked.loc[np.where(is_short)[0][0], "Coreness"])
+            if np.any(is_short)
+            else long_threshold
+        )
+        return (
+            ranked,
+            pd.Series(is_long, index=ranked.index),
+            pd.Series(is_short, index=ranked.index),
+            long_threshold,
+            short_threshold,
+        )
 
     if strategy_config.long_periphery:
-        is_long = ~is_core
-        is_short = is_core
+        long_threshold = float(
+            results_df["Coreness"].quantile(
+                strategy_config.periphery_threshold_quantile
+            )
+        )
+        is_long = results_df["Coreness"] <= long_threshold
+        if strategy_config.short_selection_quantile is None:
+            is_short = ~is_long
+            short_threshold = long_threshold
+        else:
+            short_threshold = float(
+                results_df["Coreness"].quantile(
+                    1.0 - strategy_config.short_selection_quantile
+                )
+            )
+            is_short = results_df["Coreness"] >= short_threshold
     else:
-        is_long = is_core
-        is_short = ~is_core
+        long_threshold = float(
+            results_df["Coreness"].quantile(
+                1.0 - strategy_config.periphery_threshold_quantile
+            )
+        )
+        is_long = results_df["Coreness"] >= long_threshold
+        if strategy_config.short_selection_quantile is None:
+            is_short = ~is_long
+            short_threshold = long_threshold
+        else:
+            short_threshold = float(
+                results_df["Coreness"].quantile(
+                    strategy_config.short_selection_quantile
+                )
+            )
+            is_short = results_df["Coreness"] <= short_threshold
 
-    return results_df.copy(), is_long, is_short, coreness_threshold
+    if (is_long & is_short).any():
+        raise ValueError(
+            "Long and short quantiles overlap. Reduce periphery_threshold_quantile "
+            "or short_selection_quantile."
+        )
+
+    return results_df.copy(), is_long, is_short, long_threshold, short_threshold
 
 
 def _validate_weight_caps(
@@ -590,9 +897,11 @@ def _validate_weight_caps(
     max_long_weight = strategy_config.resolved_max_long_weight
     max_short_weight = strategy_config.resolved_max_short_weight
 
-    if n_long <= 0 or n_short <= 0:
+    if n_long <= 0:
+        raise ValueError(f"Need at least one long stock, got {n_long} longs")
+    if short_total > 1e-12 and n_short <= 0:
         raise ValueError(
-            f"Need at least one long and one short stock, got {n_long} longs and {n_short} shorts"
+            f"Need at least one short stock to satisfy short_amount={short_total:.4f}, got {n_short}"
         )
 
     if max_long_weight * n_long + 1e-12 < long_total:
@@ -601,7 +910,7 @@ def _validate_weight_caps(
             f"need at least {long_total / n_long:.4f} per long to satisfy target exposure"
         )
 
-    if max_short_weight * n_short + 1e-12 < short_total:
+    if short_total > 1e-12 and max_short_weight * n_short + 1e-12 < short_total:
         raise ValueError(
             f"max_short_weight={max_short_weight:.4f} is too small for {n_short} short stocks; "
             f"need at least {short_total / n_short:.4f} per short to satisfy target exposure"
@@ -621,7 +930,7 @@ def _allocate_equal_weights(
 
     long_total, short_total = _get_side_exposures(strategy_config)
     long_weight = long_total / n_long
-    short_weight = -short_total / n_short
+    short_weight = -short_total / n_short if n_short > 0 else 0.0
     max_long_weight = strategy_config.resolved_max_long_weight
     max_short_weight = strategy_config.resolved_max_short_weight
 
@@ -629,13 +938,15 @@ def _allocate_equal_weights(
         raise ValueError(
             f"Equal long weight {long_weight:.4f} exceeds max_long_weight={max_long_weight:.4f}"
         )
-    if abs(short_weight) > max_short_weight + 1e-12:
+    if n_short > 0 and abs(short_weight) > max_short_weight + 1e-12:
         raise ValueError(
             f"Equal short weight {abs(short_weight):.4f} exceeds max_short_weight={max_short_weight:.4f}"
         )
 
     allocations_df = results_df.copy()
-    allocations_df["Allocation"] = np.where(is_long, long_weight, short_weight)
+    allocations_df["Allocation"] = 0.0
+    allocations_df.loc[is_long, "Allocation"] = long_weight
+    allocations_df.loc[is_short, "Allocation"] = short_weight
     return allocations_df
 
 
@@ -692,7 +1003,8 @@ def _allocate_coreness_proportional(
     results_df: pd.DataFrame,
     is_long: pd.Series,
     is_short: pd.Series,
-    coreness_threshold: float,
+    long_threshold: float,
+    short_threshold: float,
     strategy_config: StrategyConfig,
 ) -> pd.DataFrame:
     """Allocate exposures continuously from coreness distance within each side."""
@@ -707,21 +1019,25 @@ def _allocate_coreness_proportional(
     ]
 
     if strategy_config.long_periphery:
-        long_strengths = coreness_threshold - long_coreness
-        short_strengths = short_coreness - coreness_threshold
+        long_strengths = long_threshold - long_coreness
+        short_strengths = short_coreness - short_threshold
     else:
-        long_strengths = long_coreness - coreness_threshold
-        short_strengths = coreness_threshold - short_coreness
+        long_strengths = long_coreness - long_threshold
+        short_strengths = short_threshold - short_coreness
 
     long_weights = _allocate_capped_proportional_weights(
         long_strengths,
         total_exposure=long_total,
         max_weight=max_long_weight,
     )
-    short_weights = _allocate_capped_proportional_weights(
-        short_strengths,
-        total_exposure=short_total,
-        max_weight=max_short_weight,
+    short_weights = (
+        _allocate_capped_proportional_weights(
+            short_strengths,
+            total_exposure=short_total,
+            max_weight=max_short_weight,
+        )
+        if len(short_strengths) > 0 and short_total > 1e-12
+        else pd.Series(dtype=float)
     )
 
     allocations_df = results_df.copy()
@@ -729,9 +1045,10 @@ def _allocate_coreness_proportional(
     allocations_df.loc[is_long, "Allocation"] = allocations_df.loc[
         is_long, "Stock"
     ].map(long_weights)
-    allocations_df.loc[is_short, "Allocation"] = -allocations_df.loc[
-        is_short, "Stock"
-    ].map(short_weights)
+    if len(short_weights) > 0:
+        allocations_df.loc[is_short, "Allocation"] = -allocations_df.loc[
+            is_short, "Stock"
+        ].map(short_weights)
     return allocations_df
 
 
@@ -743,6 +1060,130 @@ def _allocate_markowitz_min_vol(
     strategy_config: StrategyConfig,
 ) -> pd.DataFrame:
     """Minimize portfolio variance subject to long/short exposure and cap constraints."""
+    return _allocate_markowitz_optimized(
+        results_df=results_df,
+        is_long=is_long,
+        is_short=is_short,
+        log_returns=log_returns,
+        strategy_config=strategy_config,
+        objective_name="min_vol",
+    )
+
+
+def _solve_risk_parity_weights(
+    cov: np.ndarray,
+    total_exposure: float,
+    max_weight: float,
+) -> np.ndarray:
+    """Solve a long-only equal-risk-contribution portfolio with fixed gross exposure."""
+    n_assets = cov.shape[0]
+    if n_assets == 0:
+        return np.array([], dtype=float)
+    if n_assets == 1:
+        return np.array([total_exposure], dtype=float)
+
+    cov = np.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
+    cov += np.eye(n_assets) * 1e-10
+
+    def objective(weights: np.ndarray) -> float:
+        portfolio_variance = float(weights @ cov @ weights)
+        portfolio_volatility = float(np.sqrt(max(portfolio_variance, 1e-18)))
+        marginal_risk = cov @ weights
+        risk_contributions = weights * marginal_risk / portfolio_volatility
+        target_contribution = portfolio_volatility / n_assets
+        return float(np.sum((risk_contributions - target_contribution) ** 2))
+
+    bounds = [(0.0, max_weight)] * n_assets
+    constraint = {"type": "eq", "fun": lambda w: np.sum(w) - total_exposure}
+    x0 = np.full(n_assets, total_exposure / n_assets, dtype=float)
+
+    optimization = minimize(
+        objective,
+        x0=x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=[constraint],
+        options={"maxiter": 500, "ftol": 1e-12},
+    )
+    if not optimization.success:
+        raise ValueError(f"Risk parity optimization failed: {optimization.message}")
+    return optimization.x
+
+
+def _allocate_risk_parity(
+    results_df: pd.DataFrame,
+    is_long: pd.Series,
+    is_short: pd.Series,
+    log_returns: pd.DataFrame,
+    strategy_config: StrategyConfig,
+) -> pd.DataFrame:
+    """Allocate each active side using equal risk contribution weights."""
+    long_tickers = results_df.loc[is_long, "Stock"].tolist()
+    short_tickers = results_df.loc[is_short, "Stock"].tolist()
+    n_long = len(long_tickers)
+    n_short = len(short_tickers)
+    _validate_weight_caps(n_long, n_short, strategy_config)
+
+    long_total, short_total = _get_side_exposures(strategy_config)
+    max_long_weight = strategy_config.resolved_max_long_weight
+    max_short_weight = strategy_config.resolved_max_short_weight
+    allocations_map: Dict[str, float] = {}
+
+    long_returns = log_returns[long_tickers].dropna(how="any")
+    if len(long_returns) < 2:
+        raise ValueError("Not enough overlapping return observations for long-side risk parity")
+    long_cov = long_returns.cov().to_numpy(dtype=float)
+    long_weights = _solve_risk_parity_weights(long_cov, long_total, max_long_weight)
+    allocations_map.update(zip(long_tickers, long_weights))
+
+    if short_total > 1e-12 and n_short > 0:
+        short_returns = log_returns[short_tickers].dropna(how="any")
+        if len(short_returns) < 2:
+            raise ValueError(
+                "Not enough overlapping return observations for short-side risk parity"
+            )
+        short_cov = short_returns.cov().to_numpy(dtype=float)
+        short_weights = _solve_risk_parity_weights(
+            short_cov,
+            short_total,
+            max_short_weight,
+        )
+        allocations_map.update(zip(short_tickers, -short_weights))
+
+    allocations_df = results_df.copy()
+    allocations_df["Allocation"] = (
+        allocations_df["Stock"].map(allocations_map).fillna(0.0)
+    )
+    return allocations_df
+
+
+def _allocate_markowitz_max_sharpe(
+    results_df: pd.DataFrame,
+    is_long: pd.Series,
+    is_short: pd.Series,
+    log_returns: pd.DataFrame,
+    strategy_config: StrategyConfig,
+) -> pd.DataFrame:
+    """Maximize ex-ante Sharpe ratio subject to long/short exposure and cap constraints."""
+    return _allocate_markowitz_optimized(
+        results_df=results_df,
+        is_long=is_long,
+        is_short=is_short,
+        log_returns=log_returns,
+        strategy_config=strategy_config,
+        objective_name="max_sharpe",
+    )
+
+
+def _allocate_markowitz_optimized(
+    results_df: pd.DataFrame,
+    is_long: pd.Series,
+    is_short: pd.Series,
+    log_returns: pd.DataFrame,
+    strategy_config: StrategyConfig,
+    objective_name: str,
+) -> pd.DataFrame:
+    """Run the shared Markowitz optimizer for the requested objective."""
     long_tickers = results_df.loc[is_long, "Stock"].tolist()
     short_tickers = results_df.loc[is_short, "Stock"].tolist()
     n_long = len(long_tickers)
@@ -762,20 +1203,29 @@ def _allocate_markowitz_min_vol(
     cov = returns_subset.cov().to_numpy(dtype=float)
     cov = np.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
     cov += np.eye(len(ordered_tickers)) * 1e-10
+    mean_returns = returns_subset.mean().to_numpy(dtype=float)
+    daily_rf = RF_RATE / 252.0
 
     def objective(x: np.ndarray) -> float:
         signed_weights = np.concatenate([x[:n_long], -x[n_long:]])
-        return float(signed_weights @ cov @ signed_weights)
+        if objective_name == "min_vol":
+            return float(signed_weights @ cov @ signed_weights)
+        if objective_name == "max_sharpe":
+            expected_return = float(signed_weights @ mean_returns)
+            variance = float(signed_weights @ cov @ signed_weights)
+            volatility = float(np.sqrt(max(variance, 1e-18)))
+            return -((expected_return - daily_rf) / volatility)
+        raise ValueError(f"Unknown Markowitz objective: {objective_name}")
 
-    constraints = [
-        {"type": "eq", "fun": lambda x: np.sum(x[:n_long]) - long_total},
-        {"type": "eq", "fun": lambda x: np.sum(x[n_long:]) - short_total},
-    ]
+    constraints = [{"type": "eq", "fun": lambda x: np.sum(x[:n_long]) - long_total}]
+    if short_total > 1e-12:
+        constraints.append(
+            {"type": "eq", "fun": lambda x: np.sum(x[n_long:]) - short_total}
+        )
     bounds = [(0.0, max_long_weight)] * n_long + [(0.0, max_short_weight)] * n_short
-    x0 = np.array(
-        [long_total / n_long] * n_long + [short_total / n_short] * n_short,
-        dtype=float,
-    )
+    x0_long = [long_total / n_long] * n_long
+    x0_short = [short_total / n_short] * n_short if n_short > 0 else []
+    x0 = np.array(x0_long + x0_short, dtype=float)
 
     optimization = minimize(
         objective,
@@ -786,13 +1236,17 @@ def _allocate_markowitz_min_vol(
         options={"maxiter": 500, "ftol": 1e-12},
     )
     if not optimization.success:
-        raise ValueError(f"Markowitz optimization failed: {optimization.message}")
+        raise ValueError(
+            f"Markowitz {objective_name} optimization failed: {optimization.message}"
+        )
 
     allocations_map = dict(zip(long_tickers, optimization.x[:n_long]))
     allocations_map.update(zip(short_tickers, -optimization.x[n_long:]))
 
     allocations_df = results_df.copy()
-    allocations_df["Allocation"] = allocations_df["Stock"].map(allocations_map)
+    allocations_df["Allocation"] = (
+        allocations_df["Stock"].map(allocations_map).fillna(0.0)
+    )
     return allocations_df
 
 
@@ -817,14 +1271,20 @@ def allocate_by_coreness(
     Returns:
         DataFrame with columns ['Stock', 'Coreness', 'Allocation', 'Coreness_Rank']
     """
-    allocations_df, is_long, is_short, coreness_threshold = _classify_coreness_buckets(
-        results_df, strategy_config
-    )
+    (
+        allocations_df,
+        is_long,
+        is_short,
+        long_threshold,
+        short_threshold,
+    ) = _classify_coreness_buckets(results_df, strategy_config, log_returns)
     n_long = int(is_long.sum())
     n_short = int(is_short.sum())
+    n_neutral = int((~is_long & ~is_short).sum())
     logger.info(
-        f"  -> {n_long} long stocks, {n_short} short stocks using {strategy_config.weighting_method} "
-        f"weighting at coreness threshold {coreness_threshold:.4f}"
+        f"  -> {n_long} long, {n_short} short, {n_neutral} neutral using "
+        f"{strategy_config.weighting_method} weighting "
+        f"(long threshold {long_threshold:.4f}, short threshold {short_threshold:.4f})"
     )
 
     if strategy_config.weighting_method == "equal":
@@ -836,7 +1296,8 @@ def allocate_by_coreness(
             allocations_df,
             is_long,
             is_short,
-            coreness_threshold,
+            long_threshold,
+            short_threshold,
             strategy_config,
         )
     elif strategy_config.weighting_method == "markowitz_min_vol":
@@ -845,16 +1306,29 @@ def allocate_by_coreness(
         allocations_df = _allocate_markowitz_min_vol(
             allocations_df, is_long, is_short, log_returns, strategy_config
         )
+    elif strategy_config.weighting_method == "risk_parity":
+        if log_returns is None:
+            raise ValueError("log_returns are required for risk parity weighting")
+        allocations_df = _allocate_risk_parity(
+            allocations_df, is_long, is_short, log_returns, strategy_config
+        )
+    elif strategy_config.weighting_method == "markowitz_max_sharpe":
+        if log_returns is None:
+            raise ValueError("log_returns are required for Markowitz weighting")
+        allocations_df = _allocate_markowitz_max_sharpe(
+            allocations_df, is_long, is_short, log_returns, strategy_config
+        )
     else:
         raise ValueError(
             f"Unknown weighting_method={strategy_config.weighting_method!r}; expected "
-            f"'equal', 'coreness_proportional', or 'markowitz_min_vol'"
+            f"'equal', 'coreness_proportional', 'risk_parity', 'markowitz_min_vol', or 'markowitz_max_sharpe'"
         )
 
     total_alloc = allocations_df["Allocation"].sum()
-    if not np.isclose(total_alloc, strategy_config.target_net_exposure):
+    expected_core_net = strategy_config.coreness_book_net_exposure
+    if not np.isclose(total_alloc, expected_core_net):
         raise ValueError(
-            f"Total allocation sums to {total_alloc:.4f}, expected {strategy_config.target_net_exposure:.4f}"
+            f"Total allocation sums to {total_alloc:.4f}, expected {expected_core_net:.4f}"
         )
 
     allocations_df = allocations_df.sort_values("Coreness", ascending=True).reset_index(
@@ -886,7 +1360,8 @@ def get_rebalance_allocations(
         Dictionary mapping rebalance_date -> allocation DataFrame
     """
     args_list = [
-        (date, ticker_list, lookback_days, strategy_config) for date in rebalance_dates
+        (date, ticker_list, lookback_days, strategy_config)
+        for date in rebalance_dates
     ]
 
     if parallel and len(rebalance_dates) > 1:
@@ -923,7 +1398,6 @@ def get_active_allocation(
 
     most_recent = max(valid_dates)
     allocation_df = rebalance_schedule[most_recent].copy()
-    # Remove the RebalanceDate and Coreness_Rank columns for calculation
     return allocation_df[["Stock", "Allocation"]]
 
 
@@ -933,11 +1407,19 @@ def calculate_portfolio_daily_values(
     start_date: str,
     end_date: str,
     initial_capital: float = 100000.0,
+    strategy_config: Optional[StrategyConfig] = None,
 ) -> pd.DataFrame:
     """
     Calculate portfolio holdings and values with proper position tracking.
-    Optimized via matrix vectorization to calculate periods between rebalances
-    simultaneously, bypassing slow day-by-day iteration.
+
+    Holdings are valued day by day. When a date appears in ``rebalance_schedule``,
+    the portfolio is first marked to market using the current holdings and that
+    day's prices, then rebalanced back to the target weights for that date.
+
+    This preserves realized returns even when the trade rebalance interval is
+    very short (for example, daily rebalancing). When the portfolio is entirely
+    in cash, a synthetic cash row is recorded so downstream daily metrics remain
+    continuous through flat exposure periods.
     """
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
@@ -950,11 +1432,8 @@ def calculate_portfolio_daily_values(
     # CRITICAL FIX: Strip out any duplicate columns before matrix operations
     prices_filtered = prices_filtered.loc[:, ~prices_filtered.columns.duplicated()]
 
-    # Extract sorted rebalance keys
-    reb_keys = pd.Series(sorted(list(rebalance_schedule.keys())))
-    reb_keys = reb_keys[reb_keys <= end]
-
-    if reb_keys.empty:
+    rebalance_dates = sorted([d for d in rebalance_schedule.keys() if d <= end])
+    if not rebalance_dates:
         return pd.DataFrame(
             columns=[
                 "Date",
@@ -965,17 +1444,13 @@ def calculate_portfolio_daily_values(
             ]
         )
 
-    # Pre-process allocations into a dictionary of Series for O(1) lookups
     allocations = {
         k: v.set_index("Stock")["Allocation"] for k, v in rebalance_schedule.items()
     }
-
-    # Map each date in prices_filtered to its currently active rebalance date
-    idx = np.searchsorted(reb_keys, prices_filtered.index, side="right") - 1
-    valid_mask = idx >= 0
-
-    # Drop dates before the first active rebalance date
-    if not valid_mask.any():
+    allocation_dates = sorted(allocations.keys())
+    first_rebalance_date = rebalance_dates[0]
+    prices_filtered = prices_filtered[prices_filtered.index >= first_rebalance_date]
+    if prices_filtered.empty:
         return pd.DataFrame(
             columns=[
                 "Date",
@@ -986,78 +1461,143 @@ def calculate_portfolio_daily_values(
             ]
         )
 
-    prices_filtered = prices_filtered[valid_mask]
-    active_reb_keys = reb_keys.iloc[idx[valid_mask]].values
+    portfolio_value = float(initial_capital)
+    cash = float(initial_capital)
+    current_shares = pd.Series(dtype=float)
+    records = []
+    strategy = strategy_config or StrategyConfig()
 
-    # Find the indices where the active rebalance key changes (chunk boundaries)
-    chunk_start_indices = np.where(active_reb_keys[:-1] != active_reb_keys[1:])[0] + 1
-    chunk_start_indices = np.insert(chunk_start_indices, 0, 0)
-    chunk_end_indices = np.append(chunk_start_indices[1:], len(prices_filtered))
+    market_drawdown_stop_enabled = bool(strategy.enable_market_drawdown_stop)
+    market_drawdown_threshold = strategy.validated_market_drawdown_threshold
+    market_ticker = strategy.normalized_market_drawdown_ticker
+    market_drawdown_action = strategy.validated_market_drawdown_action
+    market_running_peak = None
+    trading_halted_for_drawdown = False
+    portfolio_mode = "normal"
 
-    portfolio_value = initial_capital
-    all_chunks = []
-
-    # Loop through REBALANCE PERIODS instead of individual days
-    for start_idx, end_idx in zip(chunk_start_indices, chunk_end_indices):
-        reb_key = active_reb_keys[start_idx]
-
-        # Get the slice of price data for this entire rebalance period
-        chunk_prices = prices_filtered.iloc[start_idx:end_idx]
-        rebalance_prices = chunk_prices.iloc[0]
-
-        alloc_series = allocations[reb_key]
-        alloc_series = alloc_series[alloc_series.index.isin(rebalance_prices.index)]
-
-        target_dollars = alloc_series * portfolio_value
-        prices_at_reb = rebalance_prices[alloc_series.index]
-
-        # Filter valid prices (not NaN, not 0)
-        valid_price_mask = prices_at_reb.notna() & (prices_at_reb != 0)
-        valid_tickers = prices_at_reb.index[valid_price_mask]
-
-        if len(valid_tickers) == 0:
-            continue
-
-        # Calculate shares for the entire period
-        shares = target_dollars[valid_tickers] / prices_at_reb[valid_tickers]
-        shares = shares[shares != 0]
-        # Remove duplicate index labels (keep first occurrence)
-        shares = shares[~shares.index.duplicated(keep="first")]
-        valid_tickers = shares.index
-
-        if len(valid_tickers) == 0:
-            continue
-
-        invested_capital = (shares * prices_at_reb[valid_tickers]).sum()
-        cash = portfolio_value - invested_capital
-
-        # FAST VECTORIZED MATH: Calculate all daily values for this chunk at once
-        chunk_positions = chunk_prices[valid_tickers].mul(shares, axis=1)
-        chunk_port_value = chunk_positions.sum(axis=1) + cash
-
-        # Flatten (melt) the dense chunk into the required long format output
-        melted_pos = chunk_positions.reset_index().melt(
-            id_vars="index", var_name="Ticker", value_name="Position_Value"
-        )
-        melted_prices = (
-            chunk_prices[valid_tickers]
-            .reset_index()
-            .melt(id_vars="index", var_name="Ticker", value_name="Price")
+    if market_drawdown_stop_enabled and market_ticker not in prices_filtered.columns:
+        raise ValueError(
+            f"Market drawdown stop enabled but ticker {market_ticker!r} is missing from price data"
         )
 
-        melted_pos.rename(columns={"index": "Date"}, inplace=True)
-        melted_pos["Price"] = melted_prices["Price"]
-        melted_pos["Portfolio_Total_Value"] = melted_pos["Date"].map(chunk_port_value)
+    for current_date, prices_today in prices_filtered.iterrows():
+        if not current_shares.empty:
+            current_prices = prices_today.reindex(current_shares.index)
+            position_values = current_shares * current_prices
+            position_values = position_values.dropna()
+            current_shares = current_shares.reindex(position_values.index)
+            portfolio_value = float(position_values.sum() + cash)
+        else:
+            position_values = pd.Series(dtype=float)
 
-        # Drop rows where price is NaN to match your original fail-safe logic
-        melted_pos = melted_pos.dropna(subset=["Price"])
+        resumed_today = False
+        mode_changed_today = False
+        if market_drawdown_stop_enabled:
+            market_price = prices_today.get(market_ticker, np.nan)
+            if pd.notna(market_price) and market_price > 0:
+                market_running_peak = (
+                    float(market_price)
+                    if market_running_peak is None
+                    else max(market_running_peak, float(market_price))
+                )
+                market_drawdown = (
+                    (market_running_peak - float(market_price)) / market_running_peak
+                    if market_running_peak > 0
+                    else 0.0
+                )
+                if (
+                    not trading_halted_for_drawdown
+                    and market_drawdown >= market_drawdown_threshold
+                ):
+                    trading_halted_for_drawdown = True
+                    logger.info(
+                        "Market drawdown stop triggered on %s using %s drawdown %.2f%%",
+                        current_date.date(),
+                        market_ticker,
+                        market_drawdown * 100.0,
+                    )
+                elif (
+                    trading_halted_for_drawdown
+                    and market_drawdown <= market_drawdown_threshold
+                ):
+                    trading_halted_for_drawdown = False
+                    resumed_today = True
+                    logger.info(
+                        "Market drawdown stop cleared on %s using %s drawdown %.2f%%",
+                        current_date.date(),
+                        market_ticker,
+                        market_drawdown * 100.0,
+                    )
+        desired_mode = "normal"
+        if trading_halted_for_drawdown:
+            desired_mode = market_drawdown_action
+        if desired_mode != portfolio_mode:
+            portfolio_mode = desired_mode
+            mode_changed_today = True
 
-        all_chunks.append(melted_pos)
+        alloc_series = None
+        if current_date in allocations:
+            alloc_series = allocations[current_date]
+        elif (resumed_today or mode_changed_today) and allocation_dates:
+            valid_dates = [d for d in allocation_dates if d <= current_date]
+            if valid_dates:
+                alloc_series = allocations[max(valid_dates)]
 
-        # The ending portfolio value of this chunk becomes the starting capital of the next
-        portfolio_value = chunk_port_value.iloc[-1]
+        if portfolio_mode == "hold" and not current_shares.empty:
+            current_shares = pd.Series(dtype=float)
+            cash = float(portfolio_value)
+            position_values = pd.Series(dtype=float)
 
-    if not all_chunks:
+        if alloc_series is not None and portfolio_mode != "hold":
+            if portfolio_mode == "invert":
+                alloc_series = -alloc_series
+            prices_at_rebalance = prices_today.reindex(alloc_series.index)
+            valid_prices = prices_at_rebalance[
+                prices_at_rebalance.notna() & (prices_at_rebalance != 0)
+            ]
+            if not valid_prices.empty:
+                target_dollars = (
+                    alloc_series.reindex(valid_prices.index).astype(float)
+                    * portfolio_value
+                )
+                current_shares = target_dollars / valid_prices
+                current_shares = current_shares[current_shares != 0]
+                invested_capital = float(
+                    (current_shares * valid_prices.reindex(current_shares.index)).sum()
+                )
+                cash = float(portfolio_value - invested_capital)
+                position_values = current_shares * valid_prices.reindex(
+                    current_shares.index
+                )
+                portfolio_value = float(position_values.sum() + cash)
+
+        if current_shares.empty:
+            records.append(
+                {
+                    "Date": current_date,
+                    "Ticker": CASH_PROXY_TICKER,
+                    "Price": 1.0,
+                    "Position_Value": float(cash),
+                    "Portfolio_Total_Value": float(portfolio_value),
+                }
+            )
+            continue
+
+        for ticker, shares in current_shares.items():
+            price = prices_today.get(ticker, np.nan)
+            if pd.isna(price):
+                continue
+            records.append(
+                {
+                    "Date": current_date,
+                    "Ticker": ticker,
+                    "Price": float(price),
+                    "Position_Value": float(shares * price),
+                    "Portfolio_Total_Value": float(portfolio_value),
+                }
+            )
+
+    if not records:
         return pd.DataFrame(
             columns=[
                 "Date",
@@ -1068,8 +1608,7 @@ def calculate_portfolio_daily_values(
             ]
         )
 
-    # Combine all chunks and sort chronologically
-    final_df = pd.concat(all_chunks, ignore_index=True)
+    final_df = pd.DataFrame(records)
     final_df = final_df[
         ["Date", "Ticker", "Price", "Position_Value", "Portfolio_Total_Value"]
     ]
@@ -1209,11 +1748,12 @@ def compute_portfolio_snapshots(
         holdings_slice = daily_holdings[
             pd.to_datetime(daily_holdings["Date"]) == effective_date
         ].copy()
+        holdings_slice = holdings_slice[holdings_slice["Ticker"] != CASH_PROXY_TICKER]
         if holdings_slice.empty:
             continue
 
         allocation_slice = allocation_df[
-            ["Stock", "Coreness", "Allocation", "Coreness_Rank"]
+            ["Stock", "Coreness", "Allocation", "Coreness_Rank", "SignalDate"]
         ].copy()
         snapshot = holdings_slice.merge(
             allocation_slice,
@@ -1223,7 +1763,9 @@ def compute_portfolio_snapshots(
         )
         snapshot.drop(columns=["Stock"], inplace=True)
         snapshot["Snapshot_Date"] = rebalance_date
+        snapshot["Signal_Date"] = pd.to_datetime(snapshot["SignalDate"])
         snapshot["Effective_Date"] = effective_date
+        snapshot.drop(columns=["SignalDate"], inplace=True)
         snapshot["Shares"] = np.where(
             snapshot["Price"] != 0,
             snapshot["Position_Value"] / snapshot["Price"],
@@ -1244,6 +1786,7 @@ def compute_portfolio_snapshots(
     snapshots_df = snapshots_df[
         [
             "Snapshot_Date",
+            "Signal_Date",
             "Effective_Date",
             "Ticker",
             "Action",
@@ -1267,6 +1810,7 @@ def plot_last_snapshot_network(
     portfolio_snapshots: pd.DataFrame,
     lookback_days: int,
     output_dir: str,
+    network_filter: str = "none",
     corr_threshold: float = 0.3,
 ) -> Optional[str]:
     """Plot the core-periphery network for the most recent portfolio snapshot."""
@@ -1292,7 +1836,10 @@ def plot_last_snapshot_network(
         price_history_start_date=lookback_start.strftime("%Y-%m-%d"),
         price_history_end_date=analysis_end_date.strftime("%Y-%m-%d"),
     )
-    A, ticker_names = rossa.build_adjacency_matrix(log_returns)
+    A, ticker_names = rossa.build_filtered_network(
+        log_returns,
+        network_filter=network_filter,
+    )
     if len(ticker_names) < 2:
         logger.info("Skipping last snapshot network plot: insufficient cleaned tickers")
         return None
@@ -1329,6 +1876,7 @@ def plot_last_snapshot_network(
         node_size_map=node_size_map,
         node_alpha_map=node_alpha_map,
         edge_alpha_scale=0.18,
+        use_existing_edges_only=(network_filter.lower().strip() != "none"),
     )
     return output_path
 
@@ -1360,9 +1908,9 @@ def _compute_snapshot_portfolio_returns(
     lookback_days: int,
 ) -> Tuple[pd.Series, Dict[str, object]]:
     """Compute static-weights portfolio returns and sample metadata for a snapshot."""
-    snapshot_date = pd.Timestamp(snapshot_df["Snapshot_Date"].iloc[0])
-    requested_lookback_end = snapshot_date - pd.Timedelta(days=1)
-    requested_lookback_start = snapshot_date - pd.Timedelta(days=lookback_days)
+    signal_date = pd.Timestamp(snapshot_df["Signal_Date"].iloc[0])
+    requested_lookback_end = signal_date - pd.Timedelta(days=1)
+    requested_lookback_start = signal_date - pd.Timedelta(days=lookback_days)
 
     weights = snapshot_df.set_index("Ticker")["Portfolio_Weight"].dropna()
     if weights.empty:
@@ -1453,19 +2001,21 @@ def compute_snapshot_factor_exposures(
 
     exposures_by_set: Dict[str, List[Dict]] = {name: [] for name in factor_sets}
 
-    for snapshot_date, snapshot_df in portfolio_snapshots.groupby("Snapshot_Date"):
+    for signal_date, snapshot_df in portfolio_snapshots.groupby("Signal_Date"):
         try:
             portfolio_returns, sample_metadata = _compute_snapshot_portfolio_returns(
                 snapshot_df, price_data, lookback_days
             )
         except Exception as exc:
             logger.warning(
-                f"Snapshot {pd.Timestamp(snapshot_date).date()}: exposure calc skipped ({exc})"
+                f"Signal {pd.Timestamp(signal_date).date()}: exposure calc skipped ({exc})"
             )
             continue
 
+        representative_snapshot_date = pd.Timestamp(snapshot_df["Snapshot_Date"].min())
         base_record = {
-            "Snapshot_Date": pd.Timestamp(snapshot_date),
+            "Signal_Date": pd.Timestamp(signal_date),
+            "Snapshot_Date": representative_snapshot_date,
             "Effective_Date": pd.Timestamp(snapshot_df["Effective_Date"].iloc[0]),
         }
         base_record.update(sample_metadata)
@@ -1486,7 +2036,7 @@ def compute_snapshot_factor_exposures(
                 )
             except Exception as exc:
                 logger.warning(
-                    f"Snapshot {pd.Timestamp(snapshot_date).date()} {factor_set_name}: exposure calc failed ({exc})"
+                    f"Signal {pd.Timestamp(signal_date).date()} {factor_set_name}: exposure calc failed ({exc})"
                 )
                 continue
 
@@ -1513,7 +2063,7 @@ def compute_snapshot_factor_exposures(
 
     return {
         factor_set_name: pd.DataFrame(records)
-        .sort_values("Snapshot_Date")
+        .sort_values("Signal_Date")
         .reset_index(drop=True)
         for factor_set_name, records in exposures_by_set.items()
         if records
@@ -1741,6 +2291,9 @@ def _write_backtest_sheets(
             rebalance_events.append(
                 {
                     "Rebalance_Date": rebalance_date.strftime("%Y-%m-%d"),
+                    "Signal_Date": pd.Timestamp(
+                        row.get("SignalDate", rebalance_date)
+                    ).strftime("%Y-%m-%d"),
                     "Ticker": row["Stock"],
                     "Coreness": row["Coreness"],
                     "Allocation": row["Allocation"],
@@ -2578,7 +3131,12 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
         f"Backtest period: {config.start_backtest_date} to {config.end_backtest_date}"
     )
     logger.info(f"Lookback period: {config.lookback_days} days")
-    logger.info(f"Rebalance interval: {config.rebalance_interval_days} days")
+    output_dir = _resolved_output_dir(config)
+    signal_interval_days = (
+        config.signal_recalculation_interval_days or config.rebalance_interval_days
+    )
+    logger.info(f"Signal recalculation interval: {signal_interval_days} days")
+    logger.info(f"Trade rebalance interval: {config.rebalance_interval_days} days")
 
     # Determine if using dynamic or static ticker list
     is_dynamic = callable(config.ticker_list)
@@ -2589,28 +3147,42 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
     else:
         logger.info(f"Using static ticker list: {len(config.ticker_list)} tickers")
 
-    # Step 1: Generate rebalance dates first (needed for dynamic ticker fetching)
-    logger.info("[1/6] Generating rebalance schedule...")
+    # Step 1: Generate signal and trade schedules first
+    logger.info("[1/6] Generating signal and rebalance schedules...")
+    signal_dates = generate_rebalance_dates(
+        config.start_backtest_date,
+        config.end_backtest_date,
+        signal_interval_days,
+    )
     rebalance_dates = generate_rebalance_dates(
         config.start_backtest_date,
         config.end_backtest_date,
         config.rebalance_interval_days,
     )
-    logger.info(f"  → {len(rebalance_dates)} rebalance dates generated")
+    logger.info(f"  -> {len(signal_dates)} signal dates generated")
+    logger.info(f"  -> {len(rebalance_dates)} trade rebalance dates generated")
 
     # Step 2: Fetch price data
     # For dynamic mode, fetch all unique tickers across all rebalance dates
     if is_dynamic:
         all_tickers_set = set()
-        for rebalance_date in rebalance_dates:
+        for rebalance_date in signal_dates:
             tickers = config.ticker_list(rebalance_date.strftime("%Y-%m-%d"))
             all_tickers_set.update(tickers)
+        all_tickers_set.update(config.strategy.normalized_explicit_long_tickers)
+        all_tickers_set.update(config.strategy.normalized_explicit_short_tickers)
+        if config.strategy.enable_market_drawdown_stop:
+            all_tickers_set.add(config.strategy.normalized_market_drawdown_ticker)
         tickers_to_fetch = list(all_tickers_set)
         logger.info(
             f"Dynamic mode will use {len(all_tickers_set)} unique tickers across rebalance dates"
         )
     else:
         tickers_to_fetch = list(config.ticker_list)
+        tickers_to_fetch.extend(config.strategy.normalized_explicit_long_tickers)
+        tickers_to_fetch.extend(config.strategy.normalized_explicit_short_tickers)
+        if config.strategy.enable_market_drawdown_stop:
+            tickers_to_fetch.append(config.strategy.normalized_market_drawdown_ticker)
 
     if config.benchmark_tickers:
         tickers_to_fetch.extend(config.benchmark_tickers)
@@ -2630,13 +3202,14 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
 
     # Step 3: Compute allocations for each rebalance
     logger.info("[3/6] Computing allocations for each rebalance...")
-    rebalance_schedule = get_rebalance_allocations(
+    signal_schedule = get_rebalance_allocations(
         config.ticker_list,
-        rebalance_dates,
+        signal_dates,
         config.lookback_days,
         config.strategy,
         parallel=config.parallel,
     )
+    rebalance_schedule = expand_trade_schedule(signal_schedule, rebalance_dates)
 
     # Step 4: Calculate daily portfolio values
     logger.info("[4/6] Calculating daily portfolio values...")
@@ -2645,6 +3218,7 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
         rebalance_schedule,
         config.start_backtest_date,
         config.end_backtest_date,
+        strategy_config=config.strategy,
     )
 
     # Step 5: Calculate metrics
@@ -2694,10 +3268,8 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
 
     # Export Excel
     if config.output_excel is not None:
-        os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
-        output_excel_path = os.path.join(
-            str(DataConfig.OUTPUT_DIR), config.output_excel
-        )
+        os.makedirs(output_dir, exist_ok=True)
+        output_excel_path = os.path.join(output_dir, config.output_excel)
         export_to_excel(
             daily_holdings,
             portfolio_summary,
@@ -2713,10 +3285,8 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
 
     # Export summary text file
     if config.summary_file is not None:
-        os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
-        summary_file_path = os.path.join(
-            str(DataConfig.OUTPUT_DIR), config.summary_file
-        )
+        os.makedirs(output_dir, exist_ok=True)
+        summary_file_path = os.path.join(output_dir, config.summary_file)
         export_summary_txt(
             summary_stats, portfolio_summary, benchmark_metrics, summary_file_path
         )
@@ -2725,17 +3295,15 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
         export_snapshot_analysis_files(
             portfolio_snapshots,
             snapshot_factor_exposures,
-            output_dir=str(DataConfig.OUTPUT_DIR),
+            output_dir=output_dir,
         )
 
     # Generate plots (with benchmarks if available)
     if config.output_plots:
-        os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
-        plot_backtest_results(
-            portfolio_summary, benchmark_data, output_dir=str(DataConfig.OUTPUT_DIR)
-        )
+        os.makedirs(output_dir, exist_ok=True)
+        plot_backtest_results(portfolio_summary, benchmark_data, output_dir=output_dir)
         plot_backtest_results_log(
-            portfolio_summary, benchmark_data, output_dir=str(DataConfig.OUTPUT_DIR)
+            portfolio_summary, benchmark_data, output_dir=output_dir
         )
 
         # Compute and plot benchmark summary stats over time
@@ -2744,16 +3312,17 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
                 benchmark_data, rebalance_dates, lookback_days=config.lookback_days
             )
             plot_benchmark_summary_over_time(
-                benchmark_stats_over_time, output_dir=str(DataConfig.OUTPUT_DIR)
+                benchmark_stats_over_time, output_dir=output_dir
             )
 
     if config.do_plot_network:
-        os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
         try:
             plot_last_snapshot_network(
                 portfolio_snapshots=portfolio_snapshots,
                 lookback_days=config.lookback_days,
-                output_dir=str(DataConfig.OUTPUT_DIR),
+                output_dir=output_dir,
+                network_filter=config.strategy.network_filter,
             )
         except Exception as exc:
             logger.warning(f"Last snapshot network plot failed: {exc}")
@@ -2779,28 +3348,24 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
         )
 
         if factor_loadings_df is not None:
-            os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
             plot_factor_loadings_multiline(
                 factor_loadings_df,
-                os.path.join(
-                    str(DataConfig.OUTPUT_DIR), "factor_loadings_multiline.png"
-                ),
+                os.path.join(output_dir, "factor_loadings_multiline.png"),
             )
             plot_factor_loadings_subplots(
                 factor_loadings_df,
-                os.path.join(
-                    str(DataConfig.OUTPUT_DIR), "factor_loadings_subplots.png"
-                ),
+                os.path.join(output_dir, "factor_loadings_subplots.png"),
             )
             plot_factor_rsquared(
                 rsquared_series,
-                os.path.join(str(DataConfig.OUTPUT_DIR), "factor_rsquared.png"),
+                os.path.join(output_dir, "factor_rsquared.png"),
             )
             export_factor_analysis_to_excel(
                 factor_loadings_df,
                 factor_pvalues_df,
                 rsquared_series,
-                os.path.join(str(DataConfig.OUTPUT_DIR), "factor_analysis.xlsx"),
+                os.path.join(output_dir, "factor_analysis.xlsx"),
             )
 
             # Print summary of most recent loadings
@@ -2831,7 +3396,9 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
     )
 
 
-def _backtest_worker(args: Tuple[BacktestConfig, Set[str]]) -> Tuple[str, BacktestResult]:
+def _backtest_worker(
+    args: Tuple[BacktestConfig, Set[str]],
+) -> Tuple[str, BacktestResult]:
     """
     Worker function for parallel backtest execution.
     Returns: (start_date_str, BacktestResult)
@@ -2840,9 +3407,9 @@ def _backtest_worker(args: Tuple[BacktestConfig, Set[str]]) -> Tuple[str, Backte
     logging.disable(logging.CRITICAL)
 
     config, tickers_to_fetch = args
-    
+
     _ = rossa.fetch_and_cache_stock_data(tuple(tickers_to_fetch))
-    
+
     result = run_backtest(config)
     return (config.start_backtest_date, result)
 
@@ -2924,14 +3491,18 @@ def run_step_forward_evaluation(
             all_tickers_set.update(tickers)
         else:
             all_tickers_set.update(config.ticker_list)
+        all_tickers_set.update(config.strategy.normalized_explicit_long_tickers)
+        all_tickers_set.update(config.strategy.normalized_explicit_short_tickers)
         if config.benchmark_tickers:
             all_tickers_set.update(config.benchmark_tickers)
     tickers_to_fetch = list(all_tickers_set)
     logger.info(
         f"Step-forward evaluation will fetch data for {len(all_tickers_set)} unique tickers across all steps"
     )
-    
-    backtest_worker_args = list(zip(backtest_configs, [tickers_to_fetch] * len(backtest_configs)))
+
+    backtest_worker_args = list(
+        zip(backtest_configs, [tickers_to_fetch] * len(backtest_configs))
+    )
 
     if plan.parallel and len(backtest_configs) > 1:
         manager = multiprocessing.Manager()
@@ -2964,11 +3535,22 @@ def run_step_forward_evaluation(
         summary_row["Window_End"] = pd.Timestamp(config.end_backtest_date)
         summary_stats_over_time.append(summary_row)
 
+    output_dir = _resolved_output_dir(plan.base_config)
+    if (plan.summary_plot_filename or plan.summary_excel_filename) and summary_stats_over_time:
+        os.makedirs(output_dir, exist_ok=True)
     if plan.summary_plot_filename and summary_stats_over_time:
-        os.makedirs(str(DataConfig.OUTPUT_DIR), exist_ok=True)
         plot_backtest_summary_over_time(
             summary_stats_over_time,
-            os.path.join(str(DataConfig.OUTPUT_DIR), plan.summary_plot_filename),
+            os.path.join(output_dir, plan.summary_plot_filename),
+        )
+    if plan.summary_excel_filename and summary_stats_over_time:
+        summary_df = pd.DataFrame(summary_stats_over_time).copy()
+        for col in ["Date", "Window_Start", "Window_End"]:
+            if col in summary_df.columns:
+                summary_df[col] = pd.to_datetime(summary_df[col]).dt.strftime("%Y-%m-%d")
+        summary_df.to_excel(
+            os.path.join(output_dir, plan.summary_excel_filename),
+            index=False,
         )
 
     return StepForwardBacktestResult(
@@ -3038,7 +3620,7 @@ def compute_benchmark_summary_stats_over_time(
     Returns:
         Dict mapping benchmark_ticker -> List[Dict with Date, Annualized_Return, Volatility, Sharpe_Ratio]
     """
-    RF_RATE = 0.03  # 3% annual risk-free rate
+    RF_RATE = 0.0  # Paper-style benchmark summaries use zero risk-free by default
 
     benchmark_stats_over_time = {}
 

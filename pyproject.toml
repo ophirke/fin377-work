@@ -16,6 +16,7 @@ dependencies = [
     "tqdm>=4.67.3",
     "n100tickers",
     "edgartools>=5.30.0",
+    "imageio>=2.37.3",
 ]
 
 [tool.uv.workspace]

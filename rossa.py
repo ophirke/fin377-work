@@ -154,6 +154,90 @@ def build_adjacency_matrix(log_returns: pd.DataFrame) -> Tuple[np.ndarray, pd.In
     return A, tickers
 
 
+def filter_adjacency_matrix(
+    A: np.ndarray,
+    tickers: pd.Index,
+    method: str = "none",
+) -> Tuple[np.ndarray, pd.Index]:
+    """
+    Filter a correlation network before running the core-periphery algorithm.
+
+    Args:
+        A: Dense adjacency matrix in [0, 1]
+        tickers: Stock ticker names
+        method: Network filter name. Supported values:
+            - "none": keep the dense network
+            - "mst": minimum spanning tree built from correlation distances
+            - "pmfg": planar maximally filtered graph
+
+    Returns:
+        Tuple of (filtered_adjacency_matrix, ticker_names)
+    """
+    normalized_method = method.lower().strip()
+    if normalized_method == "none":
+        return A, tickers
+
+    if normalized_method not in {"mst", "pmfg"}:
+        raise ValueError(f"Unsupported network filter: {method}")
+
+    n = A.shape[0]
+    if n < 2:
+        return A, tickers
+
+    correlations = np.clip(2 * A - 1, -1.0, 1.0)
+    distances = np.sqrt(np.maximum(0.0, 2 * (1 - correlations)))
+    np.fill_diagonal(distances, 0.0)
+
+    filtered = np.zeros_like(A)
+
+    if normalized_method == "mst":
+        distance_graph = nx.from_numpy_array(distances)
+        filtered_graph = nx.minimum_spanning_tree(distance_graph, weight="weight")
+    else:
+        filtered_graph = nx.Graph()
+        filtered_graph.add_nodes_from(range(n))
+        target_edges = max(0, 3 * (n - 2))
+        upper_i, upper_j = np.triu_indices(n, k=1)
+        sort_order = np.argsort(correlations[upper_i, upper_j])[::-1]
+
+        for edge_idx in sort_order:
+            i = int(upper_i[edge_idx])
+            j = int(upper_j[edge_idx])
+            filtered_graph.add_edge(i, j, weight=float(distances[i, j]))
+            is_planar, _ = nx.check_planarity(filtered_graph, counterexample=False)
+            if not is_planar:
+                filtered_graph.remove_edge(i, j)
+                continue
+            if filtered_graph.number_of_edges() >= target_edges:
+                break
+
+    for i, j in filtered_graph.edges():
+        filtered[i, j] = A[i, j]
+        filtered[j, i] = A[j, i]
+
+    np.fill_diagonal(filtered, 0.0)
+
+    original_edges = int(np.count_nonzero(np.triu(A, k=1)))
+    filtered_edges = int(np.count_nonzero(np.triu(filtered, k=1)))
+    logger.info(
+        "Applied %s network filter: %d -> %d edges",
+        normalized_method.upper(),
+        original_edges,
+        filtered_edges,
+    )
+
+    return filtered, tickers
+
+
+def build_filtered_network(
+    log_returns: pd.DataFrame,
+    network_filter: str = "none",
+) -> Tuple[np.ndarray, pd.Index]:
+    """Build the adjacency matrix and apply the requested network filter."""
+    adjacency, tickers = build_adjacency_matrix(log_returns)
+    return filter_adjacency_matrix(adjacency, tickers, method=network_filter)
+
+
 # def rossa_core_periphery(A: np.ndarray, tickers: pd.Index) -> pd.DataFrame:
 #     """
 #     Implements core-periphery profile algorithm by Rossa et al.
@@ -290,6 +374,7 @@ def plot_network(
     node_size_map: Optional[dict] = None,
     node_alpha_map: Optional[dict] = None,
     edge_alpha_scale: float = 0.3,
+    use_existing_edges_only: bool = False,
 ) -> None:
     """
     Visualizes stock correlation network using a force-directed structure.
@@ -308,6 +393,7 @@ def plot_network(
         node_size_map: Optional per-ticker node sizes
         node_alpha_map: Optional per-ticker node alpha values
         edge_alpha_scale: Multiplier to reduce overall edge opacity
+        use_existing_edges_only: If True, draw all non-zero adjacency edges directly
     """
     G = nx.Graph()
 
@@ -322,7 +408,10 @@ def plot_network(
     for i in range(len(ticker_names)):
         for j in range(i + 1, len(ticker_names)):
             correlation = A[i, j] * 2 - 1  # Map [0, 1] back to [-1, 1]
-            if abs(correlation) > corr_threshold:
+            should_draw = (
+                A[i, j] > 0 if use_existing_edges_only else abs(correlation) > corr_threshold
+            )
+            if should_draw:
                 G.add_edge(ticker_names[i], ticker_names[j], weight=correlation)
 
     # ====================================================================
@@ -476,6 +565,7 @@ def analyze_core_periphery(
     price_history_end_date: Optional[str] = None,
     visualize_filename: Optional[str] = None,
     corr_threshold: float = 0.55,
+    network_filter: str = "none",
 ) -> pd.DataFrame:
     """
     Main analysis function: identifies core-periphery structure in stock correlations.
@@ -494,6 +584,7 @@ def analyze_core_periphery(
         visualize_filename: PNG filename for visualization or None to skip
         cache_file: CSV file for caching price data
         corr_threshold: Minimum correlation magnitude to show edge (default 0.55). Higher values reduce clutter and prevent singularity.
+        network_filter: Graph filter to apply before Rossa ("none", "mst", or "pmfg")
 
     Returns:
         DataFrame with columns ['Stock', 'Coreness'] sorted by coreness score.
@@ -511,7 +602,10 @@ def analyze_core_periphery(
 
     # Build correlation matrix
     logger.info("Building correlation network...")
-    A, ticker_names = build_adjacency_matrix(log_returns)
+    A, ticker_names = build_filtered_network(
+        log_returns,
+        network_filter=network_filter,
+    )
 
     # Identify core-periphery structure
     logger.info("Computing core-periphery decomposition...")
@@ -529,7 +623,14 @@ def analyze_core_periphery(
     # Optional visualization
     if visualize_filename:
         logger.info(f"\nGenerating visualization...")
-        plot_network(A, ticker_names, results, visualize_filename, corr_threshold=corr_threshold)
+        plot_network(
+            A,
+            ticker_names,
+            results,
+            visualize_filename,
+            corr_threshold=corr_threshold,
+            use_existing_edges_only=(network_filter.lower().strip() != "none"),
+        )
 
     logger.info("\n" + "=" * 60 + "\n")
     return results

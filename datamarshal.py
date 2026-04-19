@@ -41,8 +41,7 @@ def _load_sp500_constituents_from_file(file_path_str: str) -> tuple:
     df = pd.read_csv(file_path_str)
     # sort by weight
     df = df.sort_values(by="Weight", ascending=False)
-    tickers = df["Ticker"].tolist()
-    tickers = list(set(tickers))
+    tickers = df.drop_duplicates(subset="Ticker", keep="first")["Ticker"].tolist()
     return tuple(tickers)
 
 
