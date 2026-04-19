@@ -61,7 +61,7 @@ def create_backtests(output_dir: str | None = None):
 
     base_config = BacktestConfig(
         ticker_list=ticker_source,
-        start_backtest_date="2008-01-01",
+        start_backtest_date="2001-01-01",
         end_backtest_date="2026-04-01",
         lookback_days=lookback_days,
         signal_recalculation_interval_days=signal_recalculation_interval_days,
@@ -107,7 +107,7 @@ def create_backtests(output_dir: str | None = None):
                 factor_lookback_days=None,
                 parallel=False,
             ),
-            overall_start_date="2008-01-01",
+            overall_start_date="2002-01-01",
             overall_end_date="2026-04-01",
             eval_lookback=pd.DateOffset(years=1),
             eval_interval=pd.DateOffset(months=1),
