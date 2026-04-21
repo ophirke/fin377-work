@@ -1,0 +1,1 @@
+Generally, following GNU 3 license, EXCEPT for data retrieved from factorstoday.com, which follows their terms of service (critically, no commercial use, please refer to their terms).
